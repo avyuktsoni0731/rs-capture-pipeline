@@ -55,3 +55,35 @@ pub fn nal_units_to_avcc_sample(nals: &[Vec<u8>]) -> Vec<u8> {
     }
     v
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{nal_type, nal_units, nal_units_to_avcc_sample};
+
+    #[test]
+    fn parses_mixed_start_codes() {
+        let annexb = [
+            0, 0, 0, 1, 0x67, 0x11, 0x22, // SPS
+            0, 0, 1, 0x68, 0x33, 0x44, // PPS
+            0, 0, 0, 1, 0x65, 0xaa, 0xbb, // IDR
+        ];
+        let nals = nal_units(&annexb);
+        assert_eq!(nals.len(), 3);
+        assert_eq!(nal_type(&nals[0]), Some(7));
+        assert_eq!(nal_type(&nals[1]), Some(8));
+        assert_eq!(nal_type(&nals[2]), Some(5));
+    }
+
+    #[test]
+    fn builds_avcc_length_prefixed_sample() {
+        let nals = vec![vec![0x65, 0x01, 0x02], vec![0x41, 0x03]];
+        let avcc = nal_units_to_avcc_sample(&nals);
+        assert_eq!(
+            avcc,
+            vec![
+                0, 0, 0, 3, 0x65, 0x01, 0x02, //
+                0, 0, 0, 2, 0x41, 0x03
+            ]
+        );
+    }
+}

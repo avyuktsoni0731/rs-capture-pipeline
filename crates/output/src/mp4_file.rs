@@ -17,6 +17,7 @@ pub struct Mp4H264File {
     height: u16,
     timescale: u32,
     frame_duration: u32,
+    next_start_time: u64,
     track_added: bool,
     sps: Vec<u8>,
     pps: Vec<u8>,
@@ -26,7 +27,7 @@ impl Mp4H264File {
     pub fn create(path: impl AsRef<Path>, width: u16, height: u16, fps: u32) -> anyhow::Result<Self> {
         anyhow::ensure!(fps > 0, "fps must be > 0");
         let timescale = 30_000u32;
-        let frame_duration = timescale / fps;
+        let frame_duration = std::cmp::max(1, timescale / fps);
 
         let file = File::create(path.as_ref()).with_context(|| format!("create {}", path.as_ref().display()))?;
 
@@ -50,6 +51,7 @@ impl Mp4H264File {
             height,
             timescale,
             frame_duration,
+            next_start_time: 0,
             track_added: false,
             sps: Vec::new(),
             pps: Vec::new(),
@@ -99,12 +101,15 @@ impl Mp4H264File {
 
         let payload = nal_units_to_avcc_sample(&vcl);
         let sample = Mp4Sample {
-            start_time: 0,
+            start_time: self.next_start_time,
             duration: self.frame_duration,
             rendering_offset: 0,
             is_sync: is_keyframe,
             bytes: Bytes::from(payload),
         };
+        self.next_start_time = self
+            .next_start_time
+            .saturating_add(u64::from(self.frame_duration));
 
         self.writer
             .write_sample(1, &sample)
