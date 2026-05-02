@@ -22,6 +22,10 @@ use audio_encoder::MfAacLcEncoder;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use tracing::{debug, info, warn};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThread, SetPriorityClass, SetThreadPriority,
+    ABOVE_NORMAL_PRIORITY_CLASS, THREAD_PRIORITY_ABOVE_NORMAL,
+};
 
 const FPS: u32 = 30;
 
@@ -38,6 +42,7 @@ enum AudioMsg {
 fn audio_loopback_thread(stop: Arc<AtomicBool>, tx: Sender<AudioMsg>) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
     let run = || -> anyhow::Result<()> {
         let mut cap = audio::WasapiLoopbackCapture::new()?;
@@ -79,6 +84,15 @@ fn main() -> anyhow::Result<()> {
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // Under heavy CPU/GPU load (e.g. 4K YouTube seek), default scheduling can starve capture.
+        // ABOVE_NORMAL is gentler than HIGH but still improves timekeeping vs browser decode.
+        if std::env::var("RS_CAPTURE_NO_PRIORITY_BOOST").ok().as_deref() == Some("1") {
+            info!("RS_CAPTURE_NO_PRIORITY_BOOST=1: process priority left at NORMAL");
+        } else if SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS).is_ok() {
+            info!("Process priority: ABOVE_NORMAL (set RS_CAPTURE_NO_PRIORITY_BOOST=1 to skip)");
+        } else {
+            warn!("SetPriorityClass(ABOVE_NORMAL) failed; capture may jitter more under load");
+        }
     }
 
     let out_dir = std::env::args()

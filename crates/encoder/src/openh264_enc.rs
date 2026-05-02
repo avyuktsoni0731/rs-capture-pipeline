@@ -15,9 +15,15 @@ pub struct OpenH264VideoEncoder {
 impl OpenH264VideoEncoder {
     pub fn new(width: u32, height: u32, bitrate_bps: u32) -> anyhow::Result<Self> {
         let api = OpenH264API::from_source();
+        // `num_threads(0)` is OpenH264 "auto"; under CPU contention an explicit count often uses
+        // the core budget more predictably when other apps (e.g. browser 4K decode) are busy.
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 8) as u16)
+            .unwrap_or(4);
         let config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
-            .bitrate(BitRate::from_bps(bitrate_bps));
+            .bitrate(BitRate::from_bps(bitrate_bps))
+            .num_threads(threads);
 
         let inner = Encoder::with_api_config(api, config).map_err(|e| anyhow::anyhow!("{e}"))?;
 
