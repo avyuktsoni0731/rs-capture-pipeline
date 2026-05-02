@@ -1,4 +1,6 @@
-//! Compile `shaders/color_convert.hlsl` with the DirectX Shader Compiler (dxc).
+//! Compile `shaders/color_convert.hlsl` to **DXBC** for D3D11.
+//! Modern `dxc` often targets SM 6 + DXIL, which `ID3D11Device::CreateComputeShader` does not load.
+//! The legacy `fxc` front-end in the Windows SDK produces SM 5.0 DXBC (header `DXBC`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,34 +15,39 @@ fn main() {
     let cso = out_dir.join("color_convert.cso");
 
     println!("cargo:rerun-if-changed={}", shader.display());
-    println!("cargo:rerun-if-env-changed=DXC");
+    println!("cargo:rerun-if-env-changed=FXC");
 
-    let dxc = find_dxc().unwrap_or_else(|| {
+    let fxc = find_fxc().unwrap_or_else(|| {
         panic!(
-            "Could not find dxc.exe. Install the Windows SDK or set DXC to the full path to dxc.exe."
+            "Could not find fxc.exe (Windows SDK). Install the Windows SDK or set FXC to its path."
         )
     });
 
-    let status = Command::new(&dxc)
+    let status = Command::new(&fxc)
         .args([
-            "-T",
+            "/T",
             "cs_5_0",
-            "-E",
+            "/E",
             "CSMain",
-            "-Fo",
+            "/Fo",
             cso.to_str().expect("utf8 out path"),
             shader.to_str().expect("utf8 shader path"),
         ])
         .status()
-        .unwrap_or_else(|e| panic!("failed to run {:?}: {e}", dxc.display()));
+        .unwrap_or_else(|e| panic!("failed to run {:?}: {e}", fxc.display()));
 
     if !status.success() {
-        panic!("dxc failed compiling {}", shader.display());
+        panic!("fxc failed compiling {}", shader.display());
+    }
+
+    let meta = std::fs::metadata(&cso).expect("cso metadata");
+    if meta.len() < 32 {
+        panic!("color_convert.cso is too small ({} bytes)", meta.len());
     }
 }
 
-fn find_dxc() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("DXC") {
+fn find_fxc() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("FXC") {
         let path = PathBuf::from(p);
         if path.exists() {
             return Some(path);
@@ -50,13 +57,13 @@ fn find_dxc() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     if let Ok(bin) = std::env::var("WindowsSdkVerBinPath") {
-        candidates.push(PathBuf::from(bin).join("x64").join("dxc.exe"));
+        candidates.push(PathBuf::from(bin).join("x64").join("fxc.exe"));
     }
 
     let kits = Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
     if let Ok(read) = std::fs::read_dir(kits) {
         for e in read.flatten() {
-            let p = e.path().join("x64").join("dxc.exe");
+            let p = e.path().join("x64").join("fxc.exe");
             if p.exists() {
                 candidates.push(p);
             }

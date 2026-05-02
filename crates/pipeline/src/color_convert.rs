@@ -23,7 +23,7 @@ impl BgraToNv12Converter {
             device
                 .CreateComputeShader(CS_BLOB, None, Some(&mut cs))
                 .ok()
-                .context("CreateComputeShader color_convert.cso")?;
+                .context("CreateComputeShader (embed must be fxc/DXBC cs_5_0; see pipeline/build.rs)")?;
         }
         let cs = cs.context("compute shader null")?;
         Ok(Self { cs })
@@ -42,17 +42,13 @@ impl BgraToNv12Converter {
         unsafe { bgra.GetDesc(&mut bgra_desc) };
 
         let srv: ID3D11ShaderResourceView = {
-            let mut d = D3D11_SHADER_RESOURCE_VIEW_DESC {
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
-                Anonymous: unsafe { std::mem::zeroed() },
+            let mut d = D3D11_SHADER_RESOURCE_VIEW_DESC::default();
+            d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            d.ViewDimension = D3D_SRV_DIMENSION_TEXTURE2D;
+            d.Anonymous.Texture2D = D3D11_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
             };
-            unsafe {
-                d.Anonymous.Texture2D = D3D11_TEX2D_SRV {
-                    MostDetailedMip: 0,
-                    MipLevels: 1,
-                };
-            }
             let mut srv = None;
             unsafe {
                 device
@@ -64,14 +60,10 @@ impl BgraToNv12Converter {
         };
 
         let uav_y: ID3D11UnorderedAccessView = {
-            let mut d = D3D11_UNORDERED_ACCESS_VIEW_DESC {
-                Format: DXGI_FORMAT_R8_UINT,
-                ViewDimension: D3D11_UAV_DIMENSION_TEXTURE2D,
-                Anonymous: unsafe { std::mem::zeroed() },
-            };
-            unsafe {
-                d.Anonymous.Texture2D = D3D11_TEX2D_UAV { MipSlice: 0 };
-            }
+            let mut d = D3D11_UNORDERED_ACCESS_VIEW_DESC::default();
+            d.Format = DXGI_FORMAT_R8_UINT;
+            d.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+            d.Anonymous.Texture2D = D3D11_TEX2D_UAV { MipSlice: 0 };
             let mut uav = None;
             unsafe {
                 device
@@ -83,14 +75,10 @@ impl BgraToNv12Converter {
         };
 
         let uav_uv: ID3D11UnorderedAccessView = {
-            let mut d = D3D11_UNORDERED_ACCESS_VIEW_DESC {
-                Format: DXGI_FORMAT_R8G8_UINT,
-                ViewDimension: D3D11_UAV_DIMENSION_TEXTURE2D,
-                Anonymous: unsafe { std::mem::zeroed() },
-            };
-            unsafe {
-                d.Anonymous.Texture2D = D3D11_TEX2D_UAV { MipSlice: 0 };
-            }
+            let mut d = D3D11_UNORDERED_ACCESS_VIEW_DESC::default();
+            d.Format = DXGI_FORMAT_R8G8_UINT;
+            d.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+            d.Anonymous.Texture2D = D3D11_TEX2D_UAV { MipSlice: 0 };
             let mut uav = None;
             unsafe {
                 device
