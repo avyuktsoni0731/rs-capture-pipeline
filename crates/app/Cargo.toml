@@ -1,0 +1,15 @@
+[package]
+name = "capture-pipeline-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "capture-pipeline"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+capture = { path = "../capture" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
