@@ -13,6 +13,7 @@ members = [
 [workspace.dependencies]
 windows = { version = "0.62", features = [
   "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Direct3D10",
   "Win32_Graphics_Direct3D",
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
@@ -40,3 +41,7 @@ anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Patched `nvenc`: EOS flush with a real bitstream pointer + infallible `Drop` (upstream unwraps on destroy).
+[patch.crates-io]
+nvenc = { path = "vendor/nvenc" }

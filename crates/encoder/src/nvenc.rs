@@ -1,5 +1,7 @@
 //! NVIDIA NVENC H.264 via D3D11 session (`nvenc` crate). Feeds I420 by copying into a host IYUV input buffer.
 
+use std::mem::ManuallyDrop;
+
 use anyhow::Context;
 use nvenc::bitstream::BitStream;
 use nvenc::session::{InitParams, Session};
@@ -7,9 +9,11 @@ use nvenc::sys::enums::{
     NVencBufferFormat, NVencMemoryHeap, NVencParamsRcMode, NVencPicStruct, NVencPicType,
     NVencTuningInfo,
 };
-use nvenc::sys::guids::{NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P2_GUID, NV_ENC_PRESET_P3_GUID,
-                        NV_ENC_PRESET_P4_GUID};
+use nvenc::sys::guids::{
+    NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P2_GUID, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P4_GUID,
+};
 use nvenc::sys::result::NVencError;
+use nvenc::sys::structs::Guid;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
 use crate::traits::{EncodedPacket, VideoCodec, VideoEncoder};
@@ -83,7 +87,7 @@ unsafe fn copy_i420_to_nvenc_iyuv(
     Ok(())
 }
 
-fn pick_h264_preset(codecs: &[nvenc::sys::structs::Guid], presets: &[nvenc::sys::structs::Guid]) -> anyhow::Result<nvenc::sys::structs::Guid> {
+fn pick_h264_preset(codecs: &[Guid], presets: &[Guid]) -> anyhow::Result<Guid> {
     anyhow::ensure!(
         codecs.iter().any(|g| *g == NV_ENC_CODEC_H264_GUID),
         "NVENC session does not advertise H.264"
@@ -93,22 +97,31 @@ fn pick_h264_preset(codecs: &[nvenc::sys::structs::Guid], presets: &[nvenc::sys:
         NV_ENC_PRESET_P3_GUID,
         NV_ENC_PRESET_P2_GUID,
     ] {
-        if presets.contains(candidate) {
-            return Ok(*candidate);
+        if presets.iter().any(|g| *g == candidate) {
+            return Ok(candidate);
         }
     }
     anyhow::bail!("no supported NVENC H.264 preset (P2–P4)")
 }
 
+/// `ManuallyDrop` + custom [`Drop`] so we can EOS-flush with a valid bitstream, then free resources
+/// in a driver-friendly order (see workspace `vendor/nvenc` patch).
 struct NvencInner {
-    encoder: nvenc::encoder::Encoder,
-    input: nvenc::input_buffer::InputBuffer,
-    bitstream: BitStream,
+    bitstream: ManuallyDrop<BitStream>,
+    input: ManuallyDrop<nvenc::input_buffer::InputBuffer>,
+    encoder: ManuallyDrop<nvenc::encoder::Encoder>,
 }
 
 impl Drop for NvencInner {
     fn drop(&mut self) {
-        let _ = self.encoder.end_encode();
+        let enc: &nvenc::encoder::Encoder = &self.encoder;
+        let bs: &BitStream = &self.bitstream;
+        let _ = enc.flush_eos(bs);
+        unsafe {
+            ManuallyDrop::drop(&mut self.bitstream);
+            ManuallyDrop::drop(&mut self.input);
+            ManuallyDrop::drop(&mut self.encoder);
+        }
     }
 }
 
@@ -120,6 +133,9 @@ pub struct NvencVideoEncoder {
     frame_idx: usize,
     gop_frames: u32,
 }
+
+/// Capture uses one thread for encode; the `nvenc` safe wrappers omit `Send`.
+unsafe impl Send for NvencVideoEncoder {}
 
 impl NvencVideoEncoder {
     pub fn try_new(device: &ID3D11Device, config: &crate::EncoderConfig) -> anyhow::Result<Self> {
@@ -143,7 +159,7 @@ impl NvencVideoEncoder {
         let (session, mut preset_config) = session
             .get_encode_preset_config_ex(
                 NV_ENC_CODEC_H264_GUID,
-                preset_guid,
+                preset_guid.clone(),
                 NVencTuningInfo::LowLatency,
             )
             .map_err(|e| anyhow::anyhow!("get_encode_preset_config_ex: {e:?}"))?;
@@ -156,8 +172,6 @@ impl NvencVideoEncoder {
         preset_config.preset_cfg.frame_interval_p = 1;
         preset_config.preset_cfg.rc_params.rate_control_mode = NVencParamsRcMode::VBR;
         preset_config.preset_cfg.rc_params.average_bit_rate = config.bitrate_bps;
-        preset_config.preset_cfg.rc_params.max_bit_rate =
-            (config.bitrate_bps as u64 * 12 / 10).min(u32::MAX as u64) as u32;
 
         let init = InitParams {
             encode_guid: NV_ENC_CODEC_H264_GUID,
@@ -202,9 +216,9 @@ impl NvencVideoEncoder {
 
         Ok(Self {
             inner: NvencInner {
-                encoder,
-                input,
-                bitstream,
+                bitstream: ManuallyDrop::new(bitstream),
+                input: ManuallyDrop::new(input),
+                encoder: ManuallyDrop::new(encoder),
             },
             width,
             height,
@@ -235,9 +249,7 @@ impl VideoEncoder for NvencVideoEncoder {
         );
 
         {
-            let lock = self
-                .inner
-                .input
+            let lock = (&*self.inner.input)
                 .lock()
                 .map_err(|e| anyhow::anyhow!("lock input: {e:?}"))?;
             unsafe {
@@ -262,8 +274,8 @@ impl VideoEncoder for NvencVideoEncoder {
         self.inner
             .encoder
             .encode_picture(
-                &self.inner.input,
-                &self.inner.bitstream,
+                &*self.inner.input,
+                &*self.inner.bitstream,
                 self.frame_idx,
                 timestamp_us,
                 NVencBufferFormat::IYUV,

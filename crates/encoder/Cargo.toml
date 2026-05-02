@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 anyhow.workspace = true
-libloading = "0.8"
 nvenc = "0.1"
 openh264 = { version = "0.9", default-features = true }
 tracing.workspace = true

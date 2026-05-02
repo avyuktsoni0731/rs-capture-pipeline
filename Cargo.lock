@@ -366,8 +366,6 @@ dependencies = [
 [[package]]
 name = "nvenc"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3227c3b09b1e042dab7d8d82cea77c0404e7d0c2bbb92e7e87cb319749cd20dc"
 dependencies = [
  "bitfields",
  "libloading",

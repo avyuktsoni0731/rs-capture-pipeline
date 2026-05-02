@@ -170,7 +170,7 @@ fn main() -> anyhow::Result<()> {
 
                     let enc_cfg =
                         encoder::EncoderConfig::new(size.width, size.height, FPS, 8_000_000);
-                    video_enc = Some(encoder::create_best_encoder(&enc_cfg)?);
+                    video_enc = Some(encoder::create_best_encoder(Some(&device), &enc_cfg)?);
                     let path = format!("{out_dir}/clip.h264");
                     h264_out = Some(
                         std::fs::File::create(&path)
@@ -187,7 +187,7 @@ fn main() -> anyhow::Result<()> {
                         .with_context(|| format!("create {mp4_path}"))?,
                     );
                     info!(
-                        "GPU NV12 pool + OpenH264 at {}x{} → {} (Annex-B) + {} (MP4 avc1)",
+                        "GPU NV12 pool + video encoder at {}x{} → {} (Annex-B) + {} (MP4 avc1)",
                         size.width, size.height, path, mp4_path
                     );
                 }
@@ -197,6 +197,9 @@ fn main() -> anyhow::Result<()> {
                 converter
                     .convert(&context, &device, &tex, &targets.y, &targets.uv)
                     .context("BgraToNv12Converter::convert")?;
+                unsafe {
+                    context.Flush();
+                }
 
                 let (_yw, _yh, y_bytes) =
                     copy_r8_texture_to_bytes(&device, &context, &targets.y)?;

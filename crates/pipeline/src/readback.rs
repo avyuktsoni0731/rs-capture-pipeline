@@ -59,6 +59,9 @@ fn copy_format_texture_to_bytes(
 
     unsafe {
         context.CopyResource(&staging_tex, src);
+        // Ensure the copy reaches the staging texture before CPU Map (same-queue ordering is not
+        // always enough under GPU load / concurrent NVENC on some drivers).
+        context.Flush();
     }
 
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -71,8 +74,7 @@ fn copy_format_texture_to_bytes(
                 0,
                 Some(&mut mapped),
             )
-            .ok()
-            .context("Map readback")?;
+            .map_err(|e| anyhow::anyhow!("Map staging texture for CPU read: {e}"))?;
     }
 
     let row_pitch = mapped.RowPitch as usize;

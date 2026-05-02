@@ -1,5 +1,7 @@
 use anyhow::Context;
+use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
 };
@@ -39,6 +41,15 @@ pub fn create_d3d11_device() -> anyhow::Result<D3d11Context> {
     }
     let device = device.context("D3D11 device null")?;
     let context = context.context("D3D11 context null")?;
+
+    // NVENC (and other subsystems) may submit D3D work from other threads on the same device.
+    // Without multithread protection, the immediate context can corrupt and CPU readback `Map` fails.
+    if let Ok(mt) = device.cast::<ID3D10Multithread>() {
+        unsafe {
+            let _ = mt.SetMultithreadProtected(true);
+        }
+    }
+
     Ok(D3d11Context { device, context })
 }
 
