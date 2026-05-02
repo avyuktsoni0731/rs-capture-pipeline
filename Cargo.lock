@@ -72,6 +72,7 @@ dependencies = [
  "image",
  "tracing",
  "tracing-subscriber",
+ "windows",
 ]
 
 [[package]]

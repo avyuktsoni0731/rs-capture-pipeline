@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 capture = { path = "../capture" }
+windows.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

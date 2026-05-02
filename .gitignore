@@ -1,3 +1,5 @@
 /target
 **/*.rs.bk
 *.pdb
+/capture_out/
+/capture_out_test/

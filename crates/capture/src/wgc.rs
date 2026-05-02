@@ -1,4 +1,5 @@
 use anyhow::Context;
+use windows::core::Interface;
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
 };

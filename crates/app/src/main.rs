@@ -8,7 +8,7 @@ use capture::{
     WgcSession,
 };
 use image::{ImageBuffer, Rgba};
-use tracing::{info, warn};
+use tracing::{debug, info};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 fn main() -> anyhow::Result<()> {
@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
                 saved += 1;
             }
             Err(e) => {
-                warn!(code = ?e.code(), "no frame yet, retrying…");
+                debug!(code = ?e.code(), "no frame yet, retrying…");
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
