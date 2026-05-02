@@ -1,4 +1,5 @@
 //! Audio capture abstractions (WASAPI/mic implementations to be added).
+mod wasapi;
 
 /// Interleaved PCM audio chunk.
 #[derive(Clone, Debug)]
@@ -10,10 +11,12 @@ pub struct PcmChunk {
 }
 
 /// Audio capture source contract.
-pub trait AudioCapture: Send {
+pub trait AudioCapture {
     /// Polls one chunk if available. Non-blocking implementations can return `Ok(None)`.
     fn try_read_chunk(&mut self) -> anyhow::Result<Option<PcmChunk>>;
 }
+
+pub use wasapi::WasapiLoopbackCapture;
 
 /// Temporary source that emits silence for plumbing/integration tests.
 pub struct SilenceAudioCapture {
