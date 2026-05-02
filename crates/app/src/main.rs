@@ -68,6 +68,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let mut audio_wav: Option<audio::WavFileWriter> = None;
     let mut audio_samples_total: u64 = 0;
 
     info!(
@@ -81,6 +82,12 @@ fn main() -> anyhow::Result<()> {
             cap.channels(),
             cap.bits_per_sample()
         );
+        let wav_path = format!("{out_dir}/audio.wav");
+        audio_wav = Some(
+            audio::WavFileWriter::create(&wav_path, cap.sample_rate(), cap.channels())
+                .with_context(|| format!("create {wav_path}"))?,
+        );
+        info!("Audio probe writing PCM16 WAV: {wav_path}");
     }
 
     while saved < frame_count {
@@ -200,6 +207,10 @@ fn main() -> anyhow::Result<()> {
                 if let Some(cap) = audio_cap.as_mut() {
                     while let Some(chunk) = cap.try_read_chunk().context("try_read_chunk")? {
                         audio_samples_total += chunk.samples_f32.len() as u64;
+                        if let Some(wav) = audio_wav.as_mut() {
+                            wav.write_f32_interleaved(&chunk.samples_f32)
+                                .context("write audio.wav")?;
+                        }
                     }
                 }
 
@@ -216,6 +227,9 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(m) = mp4_out {
         m.finish().context("finalize clip.mp4")?;
+    }
+    if let Some(w) = audio_wav {
+        w.finalize().context("finalize audio.wav")?;
     }
 
     info!(

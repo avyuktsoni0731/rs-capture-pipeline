@@ -1,5 +1,6 @@
 //! Audio capture abstractions (WASAPI/mic implementations to be added).
 mod wasapi;
+mod wav;
 
 /// Interleaved PCM audio chunk.
 #[derive(Clone, Debug)]
@@ -17,6 +18,7 @@ pub trait AudioCapture {
 }
 
 pub use wasapi::WasapiLoopbackCapture;
+pub use wav::WavFileWriter;
 
 /// Temporary source that emits silence for plumbing/integration tests.
 pub struct SilenceAudioCapture {
