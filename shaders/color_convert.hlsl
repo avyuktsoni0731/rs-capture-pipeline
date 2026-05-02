@@ -48,5 +48,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     cr = clamp(cr, 16.0f, 240.0f);
 
     uint2 coordUv = uint2(id.x / 2, id.y / 2);
-    OutputUV[coordUv] = uint2((uint)cb, (uint)cr);
+    // DXGI_FORMAT_R8G8_UINT + RWTexture2D<uint2> channel packing is driver/ABI-sensitive;
+    // writing CR,CB here yields stable UV byte order in our CPU readback path.
+    OutputUV[coordUv] = uint2((uint)cr, (uint)cb);
 }

@@ -37,3 +37,32 @@ pub fn nv12_readback_to_i420(
 
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::nv12_readback_to_i420;
+
+    #[test]
+    fn nv12_to_i420_maps_uv_planes_in_expected_order() {
+        // 4x2 frame:
+        // - Y plane has 8 bytes.
+        // - UV plane has (w/2)*(h/2)*2 = 4 bytes, interleaved Cb,Cr.
+        let y = vec![10, 11, 12, 13, 14, 15, 16, 17];
+        let uv = vec![100, 150, 101, 151];
+
+        let i420 = nv12_readback_to_i420(&y, &uv, 4, 2).expect("conversion should succeed");
+
+        // Layout is Y (8), then U (2), then V (2).
+        assert_eq!(&i420[0..8], &[10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(&i420[8..10], &[100, 101]);
+        assert_eq!(&i420[10..12], &[150, 151]);
+    }
+
+    #[test]
+    fn nv12_to_i420_rejects_odd_dimensions() {
+        let y = vec![0; 9];
+        let uv = vec![0; 6];
+        let err = nv12_readback_to_i420(&y, &uv, 3, 3).expect_err("odd sizes must fail");
+        assert!(err.to_string().contains("even width/height"));
+    }
+}

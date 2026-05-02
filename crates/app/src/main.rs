@@ -19,22 +19,6 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 const FPS: u32 = 30;
 
-#[derive(Clone, Copy, Debug)]
-enum UvOrder {
-    Uv,
-    Vu,
-}
-
-impl UvOrder {
-    fn parse(s: &str) -> anyhow::Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "uv" => Ok(Self::Uv),
-            "vu" => Ok(Self::Vu),
-            _ => anyhow::bail!("invalid UV order '{s}', expected 'uv' or 'vu'"),
-        }
-    }
-}
-
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -55,11 +39,6 @@ fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(300);
     anyhow::ensure!(frame_count > 0, "frame_count must be > 0");
-    let uv_order = UvOrder::parse(
-        &std::env::args()
-            .nth(3)
-            .unwrap_or_else(|| "vu".to_string()),
-    )?;
     std::fs::create_dir_all(&out_dir).with_context(|| format!("create_dir_all {out_dir}"))?;
 
     info!("Creating D3D11 device…");
@@ -80,10 +59,7 @@ fn main() -> anyhow::Result<()> {
     let mut h264_out: Option<std::fs::File> = None;
     let mut mp4_out: Option<output::Mp4H264File> = None;
 
-    info!(
-        "Capturing {} frames at {} FPS (UV order: {:?})",
-        frame_count, FPS, uv_order
-    );
+    info!("Capturing {} frames at {} FPS", frame_count, FPS);
 
     while saved < frame_count {
         if started.elapsed() > deadline {
@@ -180,18 +156,7 @@ fn main() -> anyhow::Result<()> {
                     info!("Wrote {uv_path} (Cb/Cr as R/G)");
                 }
 
-                let uv_for_encode = match uv_order {
-                    UvOrder::Uv => uv_bytes.clone(),
-                    UvOrder::Vu => {
-                        let mut swapped = uv_bytes.clone();
-                        for pair in swapped.chunks_exact_mut(2) {
-                            pair.swap(0, 1);
-                        }
-                        swapped
-                    }
-                };
-
-                let i420 = encoder::nv12_readback_to_i420(&y_bytes, &uv_for_encode, w, h)
+                let i420 = encoder::nv12_readback_to_i420(&y_bytes, &uv_bytes, w, h)
                     .context("nv12_readback_to_i420")?;
                 let ts_us = u64::from(saved) * 1_000_000 / u64::from(FPS);
                 let pkt = video_enc
