@@ -5,15 +5,16 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Context;
 use windows::Win32::Media::MediaFoundation::{
-    AACMFTEncoder, IMFMediaType, IMFTransform, MFCreateMediaType,
+    AACMFTEncoder, IMFMediaType, IMFTransform, MFCreateAlignedMemoryBuffer, MFCreateMediaType,
     MFCreateMemoryBuffer, MFCreateSample, MFShutdown, MFStartup, MF_E_NO_MORE_TYPES,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AAC_PAYLOAD_TYPE, MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
     MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS,
     MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_USER_DATA, MF_VERSION,
     MFMediaType_Audio, MFAudioFormat_AAC,
     MFAudioFormat_PCM, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFSTARTUP_FULL,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFSTARTUP_FULL,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
@@ -29,6 +30,10 @@ pub struct MfAacLcEncoder {
     pending_pcm: Vec<i16>,
     /// Presentation time in MF 100-ns units for next input frame.
     next_input_hns: i64,
+    /// When true, `IMFTransform::ProcessOutput` requires a non-null output sample (see MS docs).
+    caller_output_sample: bool,
+    output_buffer_capacity: u32,
+    output_buffer_alignment: u32,
 }
 
 impl MfAacLcEncoder {
@@ -52,6 +57,10 @@ impl MfAacLcEncoder {
         let mft: IMFTransform = unsafe {
             CoCreateInstance(&AACMFTEncoder, None, CLSCTX_INPROC_SERVER).context("CoCreateInstance AACMFTEncoder")?
         };
+
+        let caller_output_sample;
+        let output_buffer_capacity;
+        let output_buffer_alignment;
 
         unsafe {
             mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0).ok();
@@ -106,6 +115,21 @@ impl MfAacLcEncoder {
             }
             anyhow::ensure!(set, "no AAC output type on MF AAC encoder");
 
+            let out_info = mft
+                .GetOutputStreamInfo(0)
+                .context("GetOutputStreamInfo")?;
+            let flags = out_info.dwFlags;
+            let mft_provides = (flags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
+            let mft_can_provide = (flags & MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32) != 0;
+            caller_output_sample = !mft_provides && !mft_can_provide;
+            output_buffer_capacity = if out_info.cbSize == 0 {
+                // cbSize 0 means size can vary per sample; reserve headroom for AAC-LC.
+                16 * 1024
+            } else {
+                out_info.cbSize
+            };
+            output_buffer_alignment = out_info.cbAlignment.max(1);
+
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
                 .context("MFT_MESSAGE_NOTIFY_BEGIN_STREAMING")?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
@@ -119,6 +143,9 @@ impl MfAacLcEncoder {
             frame_samples: 1024,
             pending_pcm: Vec::new(),
             next_input_hns: 0,
+            caller_output_sample,
+            output_buffer_capacity,
+            output_buffer_alignment,
         })
     }
 
@@ -212,8 +239,32 @@ impl MfAacLcEncoder {
                 dwStatus: 0,
                 pEvents: ManuallyDrop::new(None),
             };
-            let mut status = 0u32;
-            let hr = unsafe { self.mft.ProcessOutput(0, std::slice::from_mut(&mut buf), &mut status) };
+            if self.caller_output_sample {
+                unsafe {
+                    let mbuf = if self.output_buffer_alignment > 1 {
+                        MFCreateAlignedMemoryBuffer(
+                            self.output_buffer_capacity,
+                            self.output_buffer_alignment,
+                        )
+                        .context("MFCreateAlignedMemoryBuffer (AAC out)")?
+                    } else {
+                        MFCreateMemoryBuffer(self.output_buffer_capacity)
+                            .context("MFCreateMemoryBuffer (AAC out)")?
+                    };
+                    let sample = MFCreateSample().context("MFCreateSample (AAC out)")?;
+                    sample
+                        .AddBuffer(&mbuf)
+                        .context("AddBuffer (AAC out)")?;
+                    buf.pSample = ManuallyDrop::new(Some(sample));
+                }
+            }
+
+            let mut process_status = 0u32;
+            let hr = unsafe {
+                self.mft
+                    .ProcessOutput(0, std::slice::from_mut(&mut buf), &mut process_status)
+            };
+            let _ = process_status;
             if let Err(e) = hr {
                 if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
                     break;
@@ -221,18 +272,38 @@ impl MfAacLcEncoder {
                 return Err(e).context("ProcessOutput");
             }
 
-            let sample_opt = unsafe { ManuallyDrop::take(&mut buf.pSample) };
+            // Release in-band event collection before reading samples (per IMFTransform::ProcessOutput).
+            drop(ManuallyDrop::into_inner(std::mem::replace(
+                &mut buf.pEvents,
+                ManuallyDrop::new(None),
+            )));
+
+            // Do not use `ManuallyDrop::take` on `pSample`: it leaves the slot uninitialized and
+            // dropping `buf` at end of iteration is UB. Replace with a fresh `None` instead.
+            let sample_opt = ManuallyDrop::into_inner(std::mem::replace(
+                &mut buf.pSample,
+                ManuallyDrop::new(None),
+            ));
+
+            let no_sample =
+                (buf.dwStatus & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32) != 0;
+            if no_sample {
+                continue;
+            }
+
             let Some(sample) = sample_opt else {
                 continue;
             };
             let au = unsafe {
                 let buf0 = sample.GetBufferByIndex(0).context("GetBufferByIndex")?;
                 let len = buf0.GetCurrentLength().context("GetCurrentLength")?;
+                let max_len = buf0.GetMaxLength().unwrap_or(len);
+                let copy_len = (len.min(max_len)) as usize;
                 let mut ptr: *mut u8 = std::ptr::null_mut();
                 buf0.Lock(&mut ptr, None, None).context("output Lock")?;
-                let mut out = vec![0u8; len as usize];
-                if len > 0 && !ptr.is_null() {
-                    std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len as usize);
+                let mut out = vec![0u8; copy_len];
+                if copy_len > 0 && !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), copy_len);
                 }
                 buf0.Unlock().ok();
                 out
