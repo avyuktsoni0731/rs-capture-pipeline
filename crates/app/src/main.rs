@@ -1,4 +1,4 @@
-//! WGC capture + OpenH264 video + WASAPI system-audio WAV, with optional final ffmpeg mux.
+//! WGC capture + OpenH264 + WASAPI: H.264 + AAC in `clip.mp4` (Media Foundation), WAV debug, optional ffmpeg remux.
 
 use std::io::Write;
 use std::process::Command;
@@ -18,7 +18,8 @@ use pipeline::{
     copy_r8_texture_to_bytes, copy_rg8_uint_texture_to_bytes, BgraToNv12Converter, FrameSize,
     TexturePool,
 };
-use tracing::{debug, info};
+use audio_encoder::MfAacLcEncoder;
+use tracing::{debug, info, warn};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 const FPS: u32 = 30;
@@ -78,6 +79,7 @@ fn main() -> anyhow::Result<()> {
     let mut mp4_out: Option<output::Mp4H264File> = None;
     let mut audio_cap: Option<audio::WasapiLoopbackCapture> = None;
     let mut audio_wav: Option<audio::WavFileWriter> = None;
+    let mut aac_enc: Option<MfAacLcEncoder> = None;
     let mut audio_samples_total: u64 = 0;
 
     info!(
@@ -139,6 +141,23 @@ fn main() -> anyhow::Result<()> {
                                 .with_context(|| format!("create {wav_path}"))?,
                         );
                         info!("Writing system audio to WAV: {wav_path}");
+                        let aac_br = 128_000u32;
+                        match MfAacLcEncoder::new(cap.sample_rate(), cap.channels(), aac_br) {
+                            Ok(enc) => {
+                                if let Some(mp4) = mp4_out.as_mut() {
+                                    mp4
+                                        .enable_aac(cap.sample_rate(), cap.channels(), aac_br)
+                                        .with_context(|| "Mp4H264File::enable_aac")?;
+                                }
+                                aac_enc = Some(enc);
+                                info!("In-process AAC (MF AAC-LC) muxed into clip.mp4");
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "MF AAC-LC unavailable ({e:#}); clip.mp4 stays video-only, audio remains in audio.wav"
+                                );
+                            }
+                        }
                         audio_cap = Some(cap);
                     }
                 }
@@ -206,6 +225,16 @@ fn main() -> anyhow::Result<()> {
                             wav.write_f32_interleaved(&chunk.samples_f32)
                                 .context("write audio.wav")?;
                         }
+                        if let Some(enc) = aac_enc.as_mut() {
+                            let aus = enc
+                                .push_interleaved_f32(&chunk.samples_f32)
+                                .context("AAC encode")?;
+                            for au in aus {
+                                mp4
+                                    .write_aac_access_unit(&au, 1024)
+                                    .context("write AAC to MP4")?;
+                            }
+                        }
                     }
                 }
 
@@ -223,6 +252,15 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(enc) = aac_enc.as_mut() {
+        if let Some(mp4) = mp4_out.as_mut() {
+            for au in enc.flush().context("AAC flush")? {
+                mp4
+                    .write_aac_access_unit(&au, 1024)
+                    .context("write final AAC samples")?;
+            }
+        }
+    }
     if let Some(m) = mp4_out {
         m.finish().context("finalize clip.mp4")?;
     }
@@ -230,18 +268,14 @@ fn main() -> anyhow::Result<()> {
         w.finalize().context("finalize audio.wav")?;
     }
 
-    let video_mp4 = format!("{out_dir}/clip.mp4");
-    let audio_wav = format!("{out_dir}/audio.wav");
-    let muxed_mp4 = format!("{out_dir}/clip_with_audio.mp4");
-    if audio_enabled {
+    if audio_enabled && std::env::var("RS_CAPTURE_FFMPEG_MUX").ok().as_deref() == Some("1") {
+        let video_mp4 = format!("{out_dir}/clip.mp4");
+        let audio_wav = format!("{out_dir}/audio.wav");
+        let muxed_mp4 = format!("{out_dir}/clip_with_audio.mp4");
         match try_mux_with_ffmpeg(&video_mp4, &audio_wav, &muxed_mp4) {
-            Ok(true) => info!("Muxed final file with audio: {muxed_mp4}"),
-            Ok(false) => info!(
-                "ffmpeg not found; keeping separate files: {video_mp4} + {audio_wav}"
-            ),
-            Err(e) => info!(
-                "ffmpeg mux failed ({e}); keeping separate files: {video_mp4} + {audio_wav}"
-            ),
+            Ok(true) => info!("RS_CAPTURE_FFMPEG_MUX: wrote {muxed_mp4}"),
+            Ok(false) => info!("RS_CAPTURE_FFMPEG_MUX set but ffmpeg not found"),
+            Err(e) => info!("RS_CAPTURE_FFMPEG_MUX: ffmpeg failed ({e})"),
         }
     }
 

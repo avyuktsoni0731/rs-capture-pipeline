@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Context;
 use windows::Win32::Media::MediaFoundation::{
-    AACMFTEncoder, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFCreateMediaType,
+    AACMFTEncoder, IMFMediaType, IMFTransform, MFCreateMediaType,
     MFCreateMemoryBuffer, MFCreateSample, MFShutdown, MFStartup, MF_E_NO_MORE_TYPES,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE,
     MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
@@ -32,7 +32,7 @@ pub struct MfAacLcEncoder {
 
 impl MfAacLcEncoder {
     /// `bitrate_bps` is total audio bitrate (e.g. 128_000).
-    pub fn new(sample_rate: u32, channels: u16, bitrate_bps: u32) -> anyhow::Result<Self> {
+    pub fn new(sample_rate: u32, channels: u16, _bitrate_bps: u32) -> anyhow::Result<Self> {
         anyhow::ensure!(
             matches!(sample_rate, 44_100 | 48_000),
             "MF AAC-LC encoder: only 44100 or 48000 Hz supported (got {sample_rate})"

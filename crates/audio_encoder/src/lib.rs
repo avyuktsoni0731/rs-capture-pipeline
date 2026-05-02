@@ -1,5 +1,9 @@
 //! Audio encoder abstractions (AAC/Opus implementations plug in here).
 
+mod mf_aac;
+
+pub use mf_aac::MfAacLcEncoder;
+
 use audio::PcmChunk;
 
 #[derive(Clone, Debug)]
