@@ -1,16 +1,19 @@
-//! WGC capture → BGRA PNGs, GPU BGRA→NV12, software H.264 (OpenH264) to `clip.h264` (Annex-B).
+//! WGC capture + OpenH264 video + WASAPI system-audio WAV, with optional final ffmpeg mux.
 
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Duration;
 
 use anyhow::Context;
 use audio::AudioCapture;
 use capture::{
-    copy_texture_to_rgba, create_d3d11_device, default_display_id, frame_to_texture, D3d11Context,
-    WgcSession,
+    create_d3d11_device, default_display_id, frame_to_texture, D3d11Context, WgcSession,
 };
 use encoder::{self, VideoEncoder};
-use image::{ImageBuffer, Rgba};
 use pipeline::{
     copy_r8_texture_to_bytes, copy_rg8_uint_texture_to_bytes, BgraToNv12Converter, FrameSize,
     TexturePool,
@@ -38,13 +41,21 @@ fn main() -> anyhow::Result<()> {
     let frame_count: u32 = std::env::args()
         .nth(2)
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(300);
-    anyhow::ensure!(frame_count > 0, "frame_count must be > 0");
-    let audio_probe = std::env::args()
+        .unwrap_or(0);
+    let audio_enabled = std::env::args()
         .nth(3)
-        .map(|s| s == "audio")
-        .unwrap_or(false);
+        .map(|s| s != "noaudio")
+        .unwrap_or(true);
     std::fs::create_dir_all(&out_dir).with_context(|| format!("create_dir_all {out_dir}"))?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop_flag = Arc::clone(&stop);
+        ctrlc::set_handler(move || {
+            stop_flag.store(true, Ordering::SeqCst);
+        })
+        .context("install Ctrl+C handler")?;
+    }
 
     info!("Creating D3D11 device…");
     let D3d11Context { device, context } = create_d3d11_device()?;
@@ -56,14 +67,12 @@ fn main() -> anyhow::Result<()> {
     let wgc = WgcSession::new_for_display(&device, display_id)?;
 
     let mut saved: u32 = 0;
-    let started = Instant::now();
-    let deadline = Duration::from_secs(u64::from(frame_count).saturating_mul(2) / u64::from(FPS) + 120);
 
     let mut pool_and_size: Option<(TexturePool, FrameSize)> = None;
     let mut video_enc: Option<Box<dyn VideoEncoder>> = None;
     let mut h264_out: Option<std::fs::File> = None;
     let mut mp4_out: Option<output::Mp4H264File> = None;
-    let mut audio_cap = if audio_probe {
+    let mut audio_cap = if audio_enabled {
         Some(audio::WasapiLoopbackCapture::new().context("WasapiLoopbackCapture::new")?)
     } else {
         None
@@ -72,8 +81,8 @@ fn main() -> anyhow::Result<()> {
     let mut audio_samples_total: u64 = 0;
 
     info!(
-        "Capturing {} frames at {} FPS (audio probe: {})",
-        frame_count, FPS, audio_probe
+        "Capturing at {} FPS, limit={} (0 means unlimited), system-audio={}",
+        FPS, frame_count, audio_enabled
     );
     if let Some(cap) = audio_cap.as_ref() {
         info!(
@@ -87,12 +96,18 @@ fn main() -> anyhow::Result<()> {
             audio::WavFileWriter::create(&wav_path, cap.sample_rate(), cap.channels())
                 .with_context(|| format!("create {wav_path}"))?,
         );
-        info!("Audio probe writing PCM16 WAV: {wav_path}");
+        info!("Writing system audio to WAV: {wav_path}");
     }
 
-    while saved < frame_count {
-        if started.elapsed() > deadline {
-            anyhow::bail!("timed out waiting for {frame_count} frames (got {saved})");
+    while !stop.load(Ordering::SeqCst) && (frame_count == 0 || saved < frame_count) {
+        if let Some(cap) = audio_cap.as_mut() {
+            while let Some(chunk) = cap.try_read_chunk().context("try_read_chunk")? {
+                audio_samples_total += chunk.samples_f32.len() as u64;
+                if let Some(wav) = audio_wav.as_mut() {
+                    wav.write_f32_interleaved(&chunk.samples_f32)
+                        .context("write audio.wav")?;
+                }
+            }
         }
 
         match wgc.try_next_frame() {
@@ -134,16 +149,6 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                let (w, h, rgba) =
-                    copy_texture_to_rgba(&device, &context, &tex).context("copy_texture_to_rgba")?;
-
-                let path = format!("{out_dir}/frame_{saved:02}.png");
-                let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-                    ImageBuffer::from_raw(w, h, rgba).context("ImageBuffer::from_raw")?;
-                img.save_with_format(&path, image::ImageFormat::Png)
-                    .with_context(|| format!("save {path}"))?;
-                info!("Wrote {path} ({w}x{h})");
-
                 let (pool, _) = pool_and_size.as_ref().unwrap();
                 let targets = pool.acquire().expect("pool empty");
                 converter
@@ -155,37 +160,13 @@ fn main() -> anyhow::Result<()> {
                 let (_uvw, _uvh, uv_bytes) =
                     copy_rg8_uint_texture_to_bytes(&device, &context, &targets.uv)?;
 
-                if saved == 0 {
-                    let yw = w;
-                    let yh = h;
-                    let mut y_rgba = Vec::with_capacity((yw * yh * 4) as usize);
-                    for &v in &y_bytes {
-                        y_rgba.extend_from_slice(&[v, v, v, 255]);
-                    }
-                    let y_img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-                        ImageBuffer::from_raw(yw, yh, y_rgba).context("Y ImageBuffer")?;
-                    let y_path = format!("{out_dir}/nv12_y_{saved:02}.png");
-                    y_img
-                        .save_with_format(&y_path, image::ImageFormat::Png)
-                        .with_context(|| format!("save {y_path}"))?;
-                    info!("Wrote {y_path} (luma GPU path)");
-
-                    let uw = (w + 1) / 2;
-                    let uh = (h + 1) / 2;
-                    let mut uv_rgba = Vec::with_capacity((uw * uh * 4) as usize);
-                    for chunk in uv_bytes.chunks_exact(2) {
-                        uv_rgba.extend_from_slice(&[chunk[0], chunk[1], 0, 255]);
-                    }
-                    let uv_img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-                        ImageBuffer::from_raw(uw, uh, uv_rgba).context("UV ImageBuffer")?;
-                    let uv_path = format!("{out_dir}/nv12_uv_{saved:02}.png");
-                    uv_img
-                        .save_with_format(&uv_path, image::ImageFormat::Png)
-                        .with_context(|| format!("save {uv_path}"))?;
-                    info!("Wrote {uv_path} (Cb/Cr as R/G)");
-                }
-
-                let i420 = encoder::nv12_readback_to_i420(&y_bytes, &uv_bytes, w, h)
+                let (pool, size) = pool_and_size.as_ref().unwrap();
+                let i420 = encoder::nv12_readback_to_i420(
+                    &y_bytes,
+                    &uv_bytes,
+                    size.width,
+                    size.height,
+                )
                     .context("nv12_readback_to_i420")?;
                 let ts_us = u64::from(saved) * 1_000_000 / u64::from(FPS);
                 let pkt = video_enc
@@ -204,19 +185,12 @@ fn main() -> anyhow::Result<()> {
                     .write_annex_b_frame(&pkt.data, pkt.is_keyframe)
                     .context("write clip.mp4")?;
 
-                if let Some(cap) = audio_cap.as_mut() {
-                    while let Some(chunk) = cap.try_read_chunk().context("try_read_chunk")? {
-                        audio_samples_total += chunk.samples_f32.len() as u64;
-                        if let Some(wav) = audio_wav.as_mut() {
-                            wav.write_f32_interleaved(&chunk.samples_f32)
-                                .context("write audio.wav")?;
-                        }
-                    }
-                }
-
                 pool.release(targets);
 
                 saved += 1;
+                if saved % 300 == 0 {
+                    info!("Recorded {} video frames...", saved);
+                }
             }
             Err(e) => {
                 debug!(code = ?e.code(), "no frame yet, retrying…");
@@ -232,10 +206,52 @@ fn main() -> anyhow::Result<()> {
         w.finalize().context("finalize audio.wav")?;
     }
 
+    let video_mp4 = format!("{out_dir}/clip.mp4");
+    let audio_wav = format!("{out_dir}/audio.wav");
+    let muxed_mp4 = format!("{out_dir}/clip_with_audio.mp4");
+    if audio_enabled {
+        match try_mux_with_ffmpeg(&video_mp4, &audio_wav, &muxed_mp4) {
+            Ok(true) => info!("Muxed final file with audio: {muxed_mp4}"),
+            Ok(false) => info!(
+                "ffmpeg not found; keeping separate files: {video_mp4} + {audio_wav}"
+            ),
+            Err(e) => info!(
+                "ffmpeg mux failed ({e}); keeping separate files: {video_mp4} + {audio_wav}"
+            ),
+        }
+    }
+
     info!(
-        "Done — PNGs + nv12 debug + {out_dir}/clip.h264 + {out_dir}/clip.mp4 (OpenH264), {} frames, {} audio samples observed",
-        frame_count,
+        "Done — {out_dir}/clip.h264 + {out_dir}/clip.mp4, frames={}, audio_samples={}",
+        saved,
         audio_samples_total
     );
     Ok(())
+}
+
+fn try_mux_with_ffmpeg(video_mp4: &str, audio_wav: &str, output_mp4: &str) -> anyhow::Result<bool> {
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            video_mp4,
+            "-i",
+            audio_wav,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            output_mp4,
+        ])
+        .status();
+
+    match status {
+        Ok(s) => {
+            anyhow::ensure!(s.success(), "ffmpeg exited with status {s}");
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).context("spawn ffmpeg"),
+    }
 }
