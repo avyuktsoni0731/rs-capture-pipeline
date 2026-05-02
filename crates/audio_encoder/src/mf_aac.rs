@@ -7,9 +7,10 @@ use anyhow::Context;
 use windows::Win32::Media::MediaFoundation::{
     AACMFTEncoder, IMFMediaType, IMFTransform, MFCreateMediaType,
     MFCreateMemoryBuffer, MFCreateSample, MFShutdown, MFStartup, MF_E_NO_MORE_TYPES,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE,
-    MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION, MFMediaType_Audio, MFAudioFormat_AAC,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AAC_PAYLOAD_TYPE, MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+    MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS,
+    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_USER_DATA, MF_VERSION,
+    MFMediaType_Audio, MFAudioFormat_AAC,
     MFAudioFormat_PCM, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFSTARTUP_FULL,
@@ -32,7 +33,7 @@ pub struct MfAacLcEncoder {
 
 impl MfAacLcEncoder {
     /// `bitrate_bps` is total audio bitrate (e.g. 128_000).
-    pub fn new(sample_rate: u32, channels: u16, _bitrate_bps: u32) -> anyhow::Result<Self> {
+    pub fn new(sample_rate: u32, channels: u16, bitrate_bps: u32) -> anyhow::Result<Self> {
         anyhow::ensure!(
             matches!(sample_rate, 44_100 | 48_000),
             "MF AAC-LC encoder: only 44100 or 48000 Hz supported (got {sample_rate})"
@@ -72,14 +73,32 @@ impl MfAacLcEncoder {
             let mut out_idx = 0u32;
             let mut set = false;
             loop {
-                let out_t = match mft.GetOutputAvailableType(0, out_idx) {
+                let out_partial = match mft.GetOutputAvailableType(0, out_idx) {
                     Ok(t) => t,
                     Err(e) if e.code() == MF_E_NO_MORE_TYPES => break,
                     Err(e) => return Err(e).context("GetOutputAvailableType")?,
                 };
-                let st = out_t.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
+                let st = out_partial.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
                 if st == MFAudioFormat_AAC {
-                    mft.SetOutputType(0, &out_t, 0).context("SetOutputType AAC")?;
+                    let out: IMFMediaType = MFCreateMediaType().context("MFCreateMediaType AAC out")?;
+                    out_partial
+                        .CopyAllItems(&out)
+                        .context("CopyAllItems AAC partial → full")?;
+                    out.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, sample_rate)
+                        .ok();
+                    out.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, u32::from(channels))
+                        .ok();
+                    // Compressed bitrate: bytes per second (see AAC encoder MFT docs).
+                    let avg_bytes = std::cmp::max(1, bitrate_bps / 8);
+                    out.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, avg_bytes)
+                        .context("MF_MT_AUDIO_AVG_BYTES_PER_SECOND")?;
+                    // 0 = raw AAC payload (no ADTS) for MP4 `mp4a` sample descriptions.
+                    out.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)
+                        .context("MF_MT_AAC_PAYLOAD_TYPE")?;
+                    let asc = aac_audio_specific_config(sample_rate, channels)?;
+                    out.SetBlob(&MF_MT_USER_DATA, &asc)
+                        .context("MF_MT_USER_DATA (AudioSpecificConfig)")?;
+                    mft.SetOutputType(0, &out, 0).context("SetOutputType AAC")?;
                     set = true;
                     break;
                 }
@@ -223,6 +242,36 @@ impl MfAacLcEncoder {
             }
         }
         Ok(v)
+    }
+}
+
+/// ISO/IEC 14496-3 AudioSpecificConfig for AAC-LC (minimal 2-byte form).
+pub(crate) fn aac_audio_specific_config(sample_rate: u32, channels: u16) -> anyhow::Result<[u8; 2]> {
+    let sf_idx = match sample_rate {
+        48_000 => 3u8,
+        44_100 => 4u8,
+        _ => anyhow::bail!("unsupported sample_rate for ASC: {sample_rate}"),
+    };
+    let ch_cfg = match channels {
+        1 => 1u8,
+        2 => 2u8,
+        _ => anyhow::bail!("unsupported channels for ASC: {channels}"),
+    };
+    let aot: u8 = 2; // AAC-LC
+    let b0 = (aot << 3) | (sf_idx >> 1);
+    let b1 = ((sf_idx & 1) << 7) | (ch_cfg << 3);
+    Ok([b0, b1])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aac_audio_specific_config;
+
+    #[test]
+    fn asc_bytes_match_iso_packing() {
+        assert_eq!(aac_audio_specific_config(48_000, 2).unwrap(), [0x11, 0x90]);
+        assert_eq!(aac_audio_specific_config(44_100, 2).unwrap(), [0x12, 0x10]);
+        assert_eq!(aac_audio_specific_config(48_000, 1).unwrap(), [0x11, 0x88]);
     }
 }
 
