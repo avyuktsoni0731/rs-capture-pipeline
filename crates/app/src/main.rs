@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use audio::AudioCapture;
@@ -67,16 +67,16 @@ fn main() -> anyhow::Result<()> {
     let wgc = WgcSession::new_for_display(&device, display_id)?;
 
     let mut saved: u32 = 0;
+    // Wall-clock origin for encoder timestamps (set on first encoded frame).
+    let mut video_t0: Option<Instant> = None;
+    // Previous frame wall time for variable MP4 sample durations.
+    let mut last_frame_wall: Option<Instant> = None;
 
     let mut pool_and_size: Option<(TexturePool, FrameSize)> = None;
     let mut video_enc: Option<Box<dyn VideoEncoder>> = None;
     let mut h264_out: Option<std::fs::File> = None;
     let mut mp4_out: Option<output::Mp4H264File> = None;
-    let mut audio_cap = if audio_enabled {
-        Some(audio::WasapiLoopbackCapture::new().context("WasapiLoopbackCapture::new")?)
-    } else {
-        None
-    };
+    let mut audio_cap: Option<audio::WasapiLoopbackCapture> = None;
     let mut audio_wav: Option<audio::WavFileWriter> = None;
     let mut audio_samples_total: u64 = 0;
 
@@ -84,32 +84,8 @@ fn main() -> anyhow::Result<()> {
         "Capturing at {} FPS, limit={} (0 means unlimited), system-audio={}",
         FPS, frame_count, audio_enabled
     );
-    if let Some(cap) = audio_cap.as_ref() {
-        info!(
-            "WASAPI format: {} Hz, {} ch, {} bits",
-            cap.sample_rate(),
-            cap.channels(),
-            cap.bits_per_sample()
-        );
-        let wav_path = format!("{out_dir}/audio.wav");
-        audio_wav = Some(
-            audio::WavFileWriter::create(&wav_path, cap.sample_rate(), cap.channels())
-                .with_context(|| format!("create {wav_path}"))?,
-        );
-        info!("Writing system audio to WAV: {wav_path}");
-    }
 
     while !stop.load(Ordering::SeqCst) && (frame_count == 0 || saved < frame_count) {
-        if let Some(cap) = audio_cap.as_mut() {
-            while let Some(chunk) = cap.try_read_chunk().context("try_read_chunk")? {
-                audio_samples_total += chunk.samples_f32.len() as u64;
-                if let Some(wav) = audio_wav.as_mut() {
-                    wav.write_f32_interleaved(&chunk.samples_f32)
-                        .context("write audio.wav")?;
-                }
-            }
-        }
-
         match wgc.try_next_frame() {
             Ok(frame) => {
                 let tex = frame_to_texture(&frame).context("frame_to_texture")?;
@@ -147,6 +123,24 @@ fn main() -> anyhow::Result<()> {
                         "GPU NV12 pool + OpenH264 at {}x{} → {} (Annex-B) + {} (MP4 avc1)",
                         size.width, size.height, path, mp4_path
                     );
+
+                    // Start system audio only once video is live so WAV/MUX align with frame 0.
+                    if audio_enabled && audio_cap.is_none() {
+                        let cap = audio::WasapiLoopbackCapture::new().context("WasapiLoopbackCapture::new")?;
+                        info!(
+                            "WASAPI format: {} Hz, {} ch, {} bits",
+                            cap.sample_rate(),
+                            cap.channels(),
+                            cap.bits_per_sample()
+                        );
+                        let wav_path = format!("{out_dir}/audio.wav");
+                        audio_wav = Some(
+                            audio::WavFileWriter::create(&wav_path, cap.sample_rate(), cap.channels())
+                                .with_context(|| format!("create {wav_path}"))?,
+                        );
+                        info!("Writing system audio to WAV: {wav_path}");
+                        audio_cap = Some(cap);
+                    }
                 }
 
                 let (pool, _) = pool_and_size.as_ref().unwrap();
@@ -168,7 +162,14 @@ fn main() -> anyhow::Result<()> {
                     size.height,
                 )
                     .context("nv12_readback_to_i420")?;
-                let ts_us = u64::from(saved) * 1_000_000 / u64::from(FPS);
+
+                let wall_now = Instant::now();
+                let t0 = video_t0.get_or_insert(wall_now);
+                let ts_us = wall_now
+                    .duration_since(*t0)
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
+
                 let pkt = video_enc
                     .as_mut()
                     .unwrap()
@@ -179,11 +180,34 @@ fn main() -> anyhow::Result<()> {
                     .unwrap()
                     .write_all(&pkt.data)
                     .context("write clip.h264")?;
-                mp4_out
-                    .as_mut()
-                    .unwrap()
-                    .write_annex_b_frame(&pkt.data, pkt.is_keyframe)
+
+                let mp4 = mp4_out.as_mut().unwrap();
+                let v_ts = mp4.video_timescale();
+                let nominal = std::cmp::max(1u32, v_ts / FPS);
+                let max_dur = nominal.saturating_mul(10);
+                let duration_ts = if saved == 0 {
+                    nominal
+                } else {
+                    let prev = last_frame_wall.context("last_frame_wall after first frame")?;
+                    let delta = wall_now.saturating_duration_since(prev);
+                    wall_duration_to_ts_units(delta, v_ts)
+                        .min(max_dur)
+                        .max(1)
+                };
+                last_frame_wall = Some(wall_now);
+
+                mp4.write_annex_b_frame_with_duration(&pkt.data, pkt.is_keyframe, duration_ts)
                     .context("write clip.mp4")?;
+
+                if let Some(cap) = audio_cap.as_mut() {
+                    while let Some(chunk) = cap.try_read_chunk().context("try_read_chunk")? {
+                        audio_samples_total += chunk.samples_f32.len() as u64;
+                        if let Some(wav) = audio_wav.as_mut() {
+                            wav.write_f32_interleaved(&chunk.samples_f32)
+                                .context("write audio.wav")?;
+                        }
+                    }
+                }
 
                 pool.release(targets);
 
@@ -237,11 +261,16 @@ fn try_mux_with_ffmpeg(video_mp4: &str, audio_wav: &str, output_mp4: &str) -> an
             video_mp4,
             "-i",
             audio_wav,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
             "-c:v",
             "copy",
             "-c:a",
             "aac",
-            "-shortest",
+            "-movflags",
+            "+faststart",
             output_mp4,
         ])
         .status();
@@ -254,4 +283,12 @@ fn try_mux_with_ffmpeg(video_mp4: &str, audio_wav: &str, output_mp4: &str) -> an
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).context("spawn ffmpeg"),
     }
+}
+
+fn wall_duration_to_ts_units(d: Duration, timescale_hz: u32) -> u32 {
+    let micros = d.as_micros().min(u128::from(u64::MAX)) as u64;
+    let v = micros
+        .saturating_mul(u64::from(timescale_hz))
+        .saturating_div(1_000_000);
+    u32::try_from(v).unwrap_or(u32::MAX).max(1)
 }

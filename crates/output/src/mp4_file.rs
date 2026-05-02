@@ -98,8 +98,27 @@ impl Mp4H264File {
         Ok(())
     }
 
+    /// Track timescale for the video track (same as [`Mp4H264File::create`] movie timescale).
+    pub fn video_timescale(&self) -> u32 {
+        self.timescale
+    }
+
     /// One encoded frame (`Annex-B` with start codes). `is_keyframe` marks sync samples for STSS.
+    ///
+    /// Uses a fixed per-sample duration derived from `fps` passed to [`Self::create`].
     pub fn write_annex_b_frame(&mut self, annex_b: &[u8], is_keyframe: bool) -> anyhow::Result<()> {
+        self.write_annex_b_frame_with_duration(annex_b, is_keyframe, self.frame_duration)
+    }
+
+    /// Same as [`Self::write_annex_b_frame`], but `duration_ts` is the sample duration in **video
+    /// track timescale** units (see [`Self::video_timescale`], typically 30000 ticks per second).
+    pub fn write_annex_b_frame_with_duration(
+        &mut self,
+        annex_b: &[u8],
+        is_keyframe: bool,
+        duration_ts: u32,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(duration_ts > 0, "video sample duration must be > 0");
         let nals = nal_units(annex_b);
         for nal in &nals {
             match nal_type(nal.as_slice()) {
@@ -143,14 +162,14 @@ impl Mp4H264File {
         let payload = nal_units_to_avcc_sample(&vcl);
         let sample = Mp4Sample {
             start_time: self.next_start_time,
-            duration: self.frame_duration,
+            duration: duration_ts,
             rendering_offset: 0,
             is_sync: is_keyframe,
             bytes: Bytes::from(payload),
         };
         self.next_start_time = self
             .next_start_time
-            .saturating_add(u64::from(self.frame_duration));
+            .saturating_add(u64::from(duration_ts));
 
         self.writer
             .write_sample(self.video_track_id.unwrap_or(1), &sample)
