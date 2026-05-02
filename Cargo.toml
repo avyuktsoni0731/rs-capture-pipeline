@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/capture",
+  "crates/audio",
+  "crates/pipeline",
+  "crates/encoder",
+  "crates/audio_encoder",
+  "crates/output",
+  "crates/app",
+]
+
+[workspace.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Graphics_Capture",
+  "Graphics_DirectX",
+  "Graphics_DirectX_Direct3D11",
+  "Graphics_Display",
+  "Win32_System_WinRT_Direct3D11",
+  "Win32_System_Com",
+  "Win32_Foundation",
+] }
+tokio = { version = "1", features = ["full"] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
