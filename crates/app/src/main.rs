@@ -1,5 +1,6 @@
-//! Phase 1 + 2: WGC capture → PNG dump; first frame also runs GPU BGRA→NV12 and saves Y/UV debug PNGs.
+//! WGC capture → BGRA PNGs, GPU BGRA→NV12, software H.264 (OpenH264) to `clip.h264` (Annex-B).
 
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -7,6 +8,7 @@ use capture::{
     copy_texture_to_rgba, create_d3d11_device, default_display_id, frame_to_texture, D3d11Context,
     WgcSession,
 };
+use encoder::{self, VideoEncoder};
 use image::{ImageBuffer, Rgba};
 use pipeline::{
     copy_r8_texture_to_bytes, copy_rg8_uint_texture_to_bytes, BgraToNv12Converter, FrameSize,
@@ -14,6 +16,8 @@ use pipeline::{
 };
 use tracing::{debug, info};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+const FPS: u32 = 30;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -43,9 +47,11 @@ fn main() -> anyhow::Result<()> {
 
     let mut saved: u32 = 0;
     let started = Instant::now();
-    let deadline = Duration::from_secs(45);
+    let deadline = Duration::from_secs(120);
 
     let mut pool_and_size: Option<(TexturePool, FrameSize)> = None;
+    let mut video_enc: Option<Box<dyn VideoEncoder>> = None;
+    let mut h264_out: Option<std::fs::File> = None;
 
     while saved < 10 {
         if started.elapsed() > deadline {
@@ -66,8 +72,17 @@ fn main() -> anyhow::Result<()> {
                     let pool = TexturePool::new(&device, size, 2)
                         .with_context(|| format!("TexturePool {}x{}", size.width, size.height))?;
                     pool_and_size = Some((pool, size));
+
+                    let enc_cfg =
+                        encoder::EncoderConfig::new(size.width, size.height, FPS, 8_000_000);
+                    video_enc = Some(encoder::create_best_encoder(&enc_cfg)?);
+                    let path = format!("{out_dir}/clip.h264");
+                    h264_out = Some(
+                        std::fs::File::create(&path)
+                            .with_context(|| format!("create {path}"))?,
+                    );
                     info!(
-                        "GPU NV12 pool + converter ready at {}x{}",
+                        "GPU NV12 pool + OpenH264 Annex-B output at {}x{} → {path}",
                         size.width, size.height
                     );
                 }
@@ -82,46 +97,62 @@ fn main() -> anyhow::Result<()> {
                     .with_context(|| format!("save {path}"))?;
                 info!("Wrote {path} ({w}x{h})");
 
-                if saved == 0 {
-                    let (pool, _) = pool_and_size.as_ref().unwrap();
-                    let targets = pool.acquire().expect("pool empty");
-                    converter
-                        .convert(&context, &device, &tex, &targets.y, &targets.uv)
-                        .context("BgraToNv12Converter::convert")?;
+                let (pool, _) = pool_and_size.as_ref().unwrap();
+                let targets = pool.acquire().expect("pool empty");
+                converter
+                    .convert(&context, &device, &tex, &targets.y, &targets.uv)
+                    .context("BgraToNv12Converter::convert")?;
 
-                    let (yw, yh, y_bytes) =
-                        copy_r8_texture_to_bytes(&device, &context, &targets.y)?;
+                let (_yw, _yh, y_bytes) =
+                    copy_r8_texture_to_bytes(&device, &context, &targets.y)?;
+                let (_uvw, _uvh, uv_bytes) =
+                    copy_rg8_uint_texture_to_bytes(&device, &context, &targets.uv)?;
+
+                if saved == 0 {
+                    let yw = w;
+                    let yh = h;
                     let mut y_rgba = Vec::with_capacity((yw * yh * 4) as usize);
                     for &v in &y_bytes {
-                        let g = v;
-                        y_rgba.extend_from_slice(&[g, g, g, 255]);
+                        y_rgba.extend_from_slice(&[v, v, v, 255]);
                     }
-                    let y_img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(yw, yh, y_rgba)
-                        .context("Y ImageBuffer")?;
+                    let y_img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+                        ImageBuffer::from_raw(yw, yh, y_rgba).context("Y ImageBuffer")?;
                     let y_path = format!("{out_dir}/nv12_y_{saved:02}.png");
                     y_img
                         .save_with_format(&y_path, image::ImageFormat::Png)
                         .with_context(|| format!("save {y_path}"))?;
-                    info!("Wrote {y_path} (luma from GPU NV12 path)");
+                    info!("Wrote {y_path} (luma GPU path)");
 
-                    let (uvw, uvh, uv_bytes) =
-                        copy_rg8_uint_texture_to_bytes(&device, &context, &targets.uv)?;
-                    let mut uv_rgba = Vec::with_capacity((uvw * uvh * 4) as usize);
+                    let uw = (w + 1) / 2;
+                    let uh = (h + 1) / 2;
+                    let mut uv_rgba = Vec::with_capacity((uw * uh * 4) as usize);
                     for chunk in uv_bytes.chunks_exact(2) {
-                        let cb = chunk[0];
-                        let cr = chunk[1];
-                        uv_rgba.extend_from_slice(&[cb, cr, 0, 255]);
+                        uv_rgba.extend_from_slice(&[chunk[0], chunk[1], 0, 255]);
                     }
                     let uv_img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-                        ImageBuffer::from_raw(uvw, uvh, uv_rgba).context("UV ImageBuffer")?;
+                        ImageBuffer::from_raw(uw, uh, uv_rgba).context("UV ImageBuffer")?;
                     let uv_path = format!("{out_dir}/nv12_uv_{saved:02}.png");
                     uv_img
                         .save_with_format(&uv_path, image::ImageFormat::Png)
                         .with_context(|| format!("save {uv_path}"))?;
-                    info!("Wrote {uv_path} (Cb→R, Cr→G for inspection)");
-
-                    pool.release(targets);
+                    info!("Wrote {uv_path} (Cb/Cr as R/G)");
                 }
+
+                let i420 = encoder::nv12_readback_to_i420(&y_bytes, &uv_bytes, w, h)
+                    .context("nv12_readback_to_i420")?;
+                let ts_us = u64::from(saved) * 1_000_000 / u64::from(FPS);
+                let pkt = video_enc
+                    .as_mut()
+                    .unwrap()
+                    .encode_i420(&i420, ts_us)
+                    .context("encode_i420")?;
+                h264_out
+                    .as_mut()
+                    .unwrap()
+                    .write_all(&pkt.data)
+                    .context("write clip.h264")?;
+
+                pool.release(targets);
 
                 saved += 1;
             }
@@ -132,6 +163,6 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!("Done — saved {saved} BGRA PNGs + nv12_y_00 / nv12_uv_00 under {out_dir}/");
+    info!("Done — PNGs + nv12 debug + {out_dir}/clip.h264 (Annex-B, OpenH264)");
     Ok(())
 }

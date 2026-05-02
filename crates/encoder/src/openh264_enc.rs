@@ -17,7 +17,7 @@ impl OpenH264VideoEncoder {
         let api = OpenH264API::from_source();
         let config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
-            .target_bitrate(BitRate::from_bps(bitrate_bps));
+            .bitrate(BitRate::from_bps(bitrate_bps));
 
         let inner = Encoder::with_api_config(api, config).map_err(|e| anyhow::anyhow!("{e}"))?;
 
