@@ -4,6 +4,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use audio::AudioCapture;
 use capture::{
     copy_texture_to_rgba, create_d3d11_device, default_display_id, frame_to_texture, D3d11Context,
     WgcSession,
@@ -39,6 +40,10 @@ fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(300);
     anyhow::ensure!(frame_count > 0, "frame_count must be > 0");
+    let audio_probe = std::env::args()
+        .nth(3)
+        .map(|s| s == "audio")
+        .unwrap_or(false);
     std::fs::create_dir_all(&out_dir).with_context(|| format!("create_dir_all {out_dir}"))?;
 
     info!("Creating D3D11 device…");
@@ -58,8 +63,25 @@ fn main() -> anyhow::Result<()> {
     let mut video_enc: Option<Box<dyn VideoEncoder>> = None;
     let mut h264_out: Option<std::fs::File> = None;
     let mut mp4_out: Option<output::Mp4H264File> = None;
+    let mut audio_cap = if audio_probe {
+        Some(audio::WasapiLoopbackCapture::new().context("WasapiLoopbackCapture::new")?)
+    } else {
+        None
+    };
+    let mut audio_samples_total: u64 = 0;
 
-    info!("Capturing {} frames at {} FPS", frame_count, FPS);
+    info!(
+        "Capturing {} frames at {} FPS (audio probe: {})",
+        frame_count, FPS, audio_probe
+    );
+    if let Some(cap) = audio_cap.as_ref() {
+        info!(
+            "WASAPI format: {} Hz, {} ch, {} bits",
+            cap.sample_rate(),
+            cap.channels(),
+            cap.bits_per_sample()
+        );
+    }
 
     while saved < frame_count {
         if started.elapsed() > deadline {
@@ -175,6 +197,12 @@ fn main() -> anyhow::Result<()> {
                     .write_annex_b_frame(&pkt.data, pkt.is_keyframe)
                     .context("write clip.mp4")?;
 
+                if let Some(cap) = audio_cap.as_mut() {
+                    while let Some(chunk) = cap.try_read_chunk().context("try_read_chunk")? {
+                        audio_samples_total += chunk.samples_f32.len() as u64;
+                    }
+                }
+
                 pool.release(targets);
 
                 saved += 1;
@@ -191,8 +219,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     info!(
-        "Done — PNGs + nv12 debug + {out_dir}/clip.h264 + {out_dir}/clip.mp4 (OpenH264), {} frames",
-        frame_count
+        "Done — PNGs + nv12 debug + {out_dir}/clip.h264 + {out_dir}/clip.mp4 (OpenH264), {} frames, {} audio samples observed",
+        frame_count,
+        audio_samples_total
     );
     Ok(())
 }

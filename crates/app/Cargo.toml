@@ -13,6 +13,7 @@ capture = { path = "../capture" }
 pipeline = { path = "../pipeline" }
 encoder = { path = "../encoder" }
 output = { path = "../output" }
+audio = { path = "../audio" }
 windows.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 tracing.workspace = true
