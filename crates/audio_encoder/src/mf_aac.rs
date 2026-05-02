@@ -4,7 +4,6 @@ use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Context;
-use windows::core::Interface;
 use windows::Win32::Media::MediaFoundation::{
     AACMFTEncoder, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFCreateMediaType,
     MFCreateMemoryBuffer, MFCreateSample, MFShutdown, MFStartup, MF_E_NO_MORE_TYPES,
@@ -115,7 +114,8 @@ impl MfAacLcEncoder {
         let mut out_aus = Vec::new();
         let frame_len = (self.frame_samples as usize) * (self.channels as usize);
         while self.pending_pcm.len() >= frame_len {
-            let chunk: Vec<i16> = self.pending_pcm.drain(..frame_len).collect();
+            let chunk: Vec<i16> = self.pending_pcm[..frame_len].to_vec();
+            self.pending_pcm.drain(..frame_len);
             let aus = self.encode_pcm_frame(&chunk)?;
             out_aus.extend(aus);
         }
@@ -187,46 +187,42 @@ impl MfAacLcEncoder {
     fn drain_all_output(&mut self) -> anyhow::Result<Vec<Vec<u8>>> {
         let mut v = Vec::new();
         loop {
-            match self.try_process_one_output() {
-                Ok(Some(au)) => v.push(au),
-                Ok(None) => break,
-                Err(e) => return Err(e),
+            let mut buf = MFT_OUTPUT_DATA_BUFFER {
+                dwStreamID: 0,
+                pSample: ManuallyDrop::new(None),
+                dwStatus: 0,
+                pEvents: ManuallyDrop::new(None),
+            };
+            let mut status = 0u32;
+            let hr = unsafe { self.mft.ProcessOutput(0, std::slice::from_mut(&mut buf), &mut status) };
+            if let Err(e) = hr {
+                if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
+                    break;
+                }
+                return Err(e).context("ProcessOutput");
+            }
+
+            let sample_opt = unsafe { ManuallyDrop::take(&mut buf.pSample) };
+            let Some(sample) = sample_opt else {
+                continue;
+            };
+            let au = unsafe {
+                let buf0 = sample.GetBufferByIndex(0).context("GetBufferByIndex")?;
+                let len = buf0.GetCurrentLength().context("GetCurrentLength")?;
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                buf0.Lock(&mut ptr, None, None).context("output Lock")?;
+                let mut out = vec![0u8; len as usize];
+                if len > 0 && !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len as usize);
+                }
+                buf0.Unlock().ok();
+                out
+            };
+            if !au.is_empty() {
+                v.push(au);
             }
         }
         Ok(v)
-    }
-
-    fn try_process_one_output(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
-        let mut buf = MFT_OUTPUT_DATA_BUFFER {
-            dwStreamID: 0,
-            pSample: ManuallyDrop::new(None),
-            dwStatus: 0,
-            pEvents: ManuallyDrop::new(None),
-        };
-        let mut status = 0u32;
-        let hr = unsafe { self.mft.ProcessOutput(0, &mut [buf], &mut status) };
-        if let Err(e) = hr {
-            if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
-                return Ok(None);
-            }
-            return Err(e).context("ProcessOutput");
-        }
-
-        let sample = unsafe {
-            let s = buf.pSample.as_ref().context("MFT output sample missing")?;
-            let buf0 = s.GetBufferByIndex(0).context("GetBufferByIndex")?;
-            let len = buf0.GetCurrentLength().context("GetCurrentLength")?;
-            let mut ptr: *mut u8 = std::ptr::null_mut();
-            buf0.Lock(&mut ptr, None, None).context("output Lock")?;
-            let mut au = vec![0u8; len as usize];
-            if len > 0 && !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(ptr, au.as_mut_ptr(), len as usize);
-            }
-            buf0.Unlock().ok();
-            au
-        };
-
-        Ok(if sample.is_empty() { None } else { Some(sample) })
     }
 }
 
