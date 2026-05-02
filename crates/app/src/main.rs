@@ -9,7 +9,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use audio::AudioCapture;
+use audio::{AudioCapture, PcmChunk};
 use capture::{
     create_d3d11_device, default_display_id, frame_to_texture, D3d11Context, WgcSession,
 };
@@ -19,10 +19,55 @@ use pipeline::{
     TexturePool,
 };
 use audio_encoder::MfAacLcEncoder;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use tracing::{debug, info, warn};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 const FPS: u32 = 30;
+
+enum AudioMsg {
+    Ready {
+        sample_rate: u32,
+        channels: u16,
+        bits_per_sample: u16,
+    },
+    Chunk(PcmChunk),
+    Error(String),
+}
+
+fn audio_loopback_thread(stop: Arc<AtomicBool>, tx: Sender<AudioMsg>) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let run = || -> anyhow::Result<()> {
+        let mut cap = audio::WasapiLoopbackCapture::new()?;
+        tx.send(AudioMsg::Ready {
+            sample_rate: cap.sample_rate(),
+            channels: cap.channels(),
+            bits_per_sample: cap.bits_per_sample(),
+        })
+        .map_err(|_| anyhow::anyhow!("capture-pipeline dropped audio receiver before Ready"))?;
+
+        while !stop.load(Ordering::SeqCst) {
+            match cap.try_read_chunk() {
+                Ok(Some(chunk)) => {
+                    if tx.send(AudioMsg::Chunk(chunk)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                Err(e) => {
+                    let _ = tx.send(AudioMsg::Error(format!("{e:#}")));
+                    break;
+                }
+            }
+        }
+        Ok(())
+    };
+    if let Err(e) = run() {
+        let _ = tx.send(AudioMsg::Error(format!("{e:#}")));
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -77,10 +122,16 @@ fn main() -> anyhow::Result<()> {
     let mut video_enc: Option<Box<dyn VideoEncoder>> = None;
     let mut h264_out: Option<std::fs::File> = None;
     let mut mp4_out: Option<output::Mp4H264File> = None;
-    let mut audio_cap: Option<audio::WasapiLoopbackCapture> = None;
+    let mut audio_rx: Option<Receiver<AudioMsg>> = None;
+    let mut audio_thread: Option<std::thread::JoinHandle<()>> = None;
+    let mut audio_sample_rate: u32 = 0;
+    let mut audio_pcm_channels: u16 = 2;
     let mut audio_wav: Option<audio::WavFileWriter> = None;
     let mut aac_enc: Option<MfAacLcEncoder> = None;
     let mut audio_samples_total: u64 = 0;
+    // Drop this many PCM frames (per-channel time slots) from the start so MP4 audio matches frame 0.
+    let mut pending_audio_frame_skip: u64 = 0;
+    let mut audio_frame_skip_bootstrapped = false;
 
     info!(
         "Capturing at {} FPS, limit={} (0 means unlimited), system-audio={}",
@@ -125,41 +176,6 @@ fn main() -> anyhow::Result<()> {
                         "GPU NV12 pool + OpenH264 at {}x{} → {} (Annex-B) + {} (MP4 avc1)",
                         size.width, size.height, path, mp4_path
                     );
-
-                    // Start system audio only once video is live so WAV/MUX align with frame 0.
-                    if audio_enabled && audio_cap.is_none() {
-                        let cap = audio::WasapiLoopbackCapture::new().context("WasapiLoopbackCapture::new")?;
-                        info!(
-                            "WASAPI format: {} Hz, {} ch, {} bits",
-                            cap.sample_rate(),
-                            cap.channels(),
-                            cap.bits_per_sample()
-                        );
-                        let wav_path = format!("{out_dir}/audio.wav");
-                        audio_wav = Some(
-                            audio::WavFileWriter::create(&wav_path, cap.sample_rate(), cap.channels())
-                                .with_context(|| format!("create {wav_path}"))?,
-                        );
-                        info!("Writing system audio to WAV: {wav_path}");
-                        let aac_br = 128_000u32;
-                        match MfAacLcEncoder::new(cap.sample_rate(), cap.channels(), aac_br) {
-                            Ok(enc) => {
-                                if let Some(mp4) = mp4_out.as_mut() {
-                                    mp4
-                                        .enable_aac(cap.sample_rate(), cap.channels(), aac_br)
-                                        .with_context(|| "Mp4H264File::enable_aac")?;
-                                }
-                                aac_enc = Some(enc);
-                                info!("In-process AAC (MF AAC-LC) muxed into clip.mp4");
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "MF AAC-LC unavailable ({e:#}); clip.mp4 stays video-only, audio remains in audio.wav"
-                                );
-                            }
-                        }
-                        audio_cap = Some(cap);
-                    }
                 }
 
                 let (pool, _) = pool_and_size.as_ref().unwrap();
@@ -183,7 +199,68 @@ fn main() -> anyhow::Result<()> {
                     .context("nv12_readback_to_i420")?;
 
                 let wall_now = Instant::now();
+                let first_wall_anchor = video_t0.is_none();
                 let t0 = video_t0.get_or_insert(wall_now);
+
+                // Start loopback **after** the first wall-clock anchor so PTS 0 matches frame 0,
+                // and so we do not accumulate a second of preroll in the WASAPI ring buffer.
+                if first_wall_anchor && audio_enabled && audio_rx.is_none() {
+                    let (tx, rx) = unbounded::<AudioMsg>();
+                    let stop_a = Arc::clone(&stop);
+                    let join = std::thread::spawn(move || audio_loopback_thread(stop_a, tx));
+
+                    match rx.recv() {
+                        Ok(AudioMsg::Ready {
+                            sample_rate,
+                            channels,
+                            bits_per_sample,
+                        }) => {
+                            audio_sample_rate = sample_rate;
+                            audio_pcm_channels = channels;
+                            info!(
+                                "WASAPI format: {} Hz, {} ch, {} bits (dedicated capture thread)",
+                                sample_rate, channels, bits_per_sample
+                            );
+                            let wav_path = format!("{out_dir}/audio.wav");
+                            audio_wav = Some(
+                                audio::WavFileWriter::create(&wav_path, sample_rate, channels)
+                                    .with_context(|| format!("create {wav_path}"))?,
+                            );
+                            info!("Writing system audio to WAV: {wav_path}");
+                            let aac_br = 128_000u32;
+                            match MfAacLcEncoder::new(sample_rate, channels, aac_br) {
+                                Ok(enc) => {
+                                    if let Some(mp4) = mp4_out.as_mut() {
+                                        mp4
+                                            .enable_aac(sample_rate, channels, aac_br)
+                                            .with_context(|| "Mp4H264File::enable_aac")?;
+                                    }
+                                    aac_enc = Some(enc);
+                                    info!("In-process AAC (MF AAC-LC) muxed into clip.mp4");
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "MF AAC-LC unavailable ({e:#}); clip.mp4 stays video-only, audio remains in audio.wav"
+                                    );
+                                }
+                            }
+                            audio_rx = Some(rx);
+                            audio_thread = Some(join);
+                        }
+                        Ok(AudioMsg::Error(e)) => {
+                            warn!("WASAPI loopback failed to start: {e}");
+                            let _ = join.join();
+                        }
+                        Ok(AudioMsg::Chunk(_)) => {
+                            anyhow::bail!("internal error: first audio message was Chunk");
+                        }
+                        Err(_) => {
+                            warn!("audio capture thread disconnected before Ready");
+                            let _ = join.join();
+                        }
+                    }
+                }
+
                 let ts_us = wall_now
                     .duration_since(*t0)
                     .as_micros()
@@ -218,21 +295,50 @@ fn main() -> anyhow::Result<()> {
                 mp4.write_annex_b_frame_with_duration(&pkt.data, pkt.is_keyframe, duration_ts)
                     .context("write clip.mp4")?;
 
-                if let Some(cap) = audio_cap.as_mut() {
-                    while let Some(chunk) = cap.try_read_chunk().context("try_read_chunk")? {
-                        audio_samples_total += chunk.samples_f32.len() as u64;
-                        if let Some(wav) = audio_wav.as_mut() {
-                            wav.write_f32_interleaved(&chunk.samples_f32)
-                                .context("write audio.wav")?;
+                if let Some(rx) = audio_rx.as_ref() {
+                    if !audio_frame_skip_bootstrapped {
+                        if let Some(t0) = video_t0.as_ref() {
+                            if audio_sample_rate > 0 {
+                                let elapsed = Instant::now().saturating_duration_since(*t0);
+                                pending_audio_frame_skip =
+                                    wall_duration_to_pcm_frames(elapsed, audio_sample_rate);
+                                audio_frame_skip_bootstrapped = true;
+                            }
                         }
-                        if let Some(enc) = aac_enc.as_mut() {
-                            let aus = enc
-                                .push_interleaved_f32(&chunk.samples_f32)
-                                .context("AAC encode")?;
-                            for au in aus {
-                                mp4
-                                    .write_aac_access_unit(&au, 1024)
-                                    .context("write AAC to MP4")?;
+                    }
+                    while let Ok(msg) = rx.try_recv() {
+                        match msg {
+                            AudioMsg::Chunk(mut chunk) => {
+                                trim_interleaved_f32_frames_front(
+                                    &mut chunk.samples_f32,
+                                    audio_pcm_channels,
+                                    &mut pending_audio_frame_skip,
+                                );
+                                if chunk.samples_f32.is_empty() {
+                                    continue;
+                                }
+                                audio_samples_total += chunk.samples_f32.len() as u64;
+                                if let Some(wav) = audio_wav.as_mut() {
+                                    wav.write_f32_interleaved(&chunk.samples_f32)
+                                        .context("write audio.wav")?;
+                                }
+                                if let Some(enc) = aac_enc.as_mut() {
+                                    let aus = enc
+                                        .push_interleaved_f32(&chunk.samples_f32)
+                                        .context("AAC encode")?;
+                                    for au in aus {
+                                        mp4
+                                            .write_aac_access_unit(&au, 1024)
+                                            .context("write AAC to MP4")?;
+                                    }
+                                }
+                            }
+                            AudioMsg::Error(e) => {
+                                warn!("audio capture thread: {e}");
+                                break;
+                            }
+                            AudioMsg::Ready { .. } => {
+                                warn!("unexpected duplicate WASAPI Ready message; ignoring");
                             }
                         }
                     }
@@ -250,6 +356,46 @@ fn main() -> anyhow::Result<()> {
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    if let Some(rx) = audio_rx.take() {
+        if let Some(mp4) = mp4_out.as_mut() {
+            for msg in rx.try_iter() {
+                match msg {
+                    AudioMsg::Chunk(mut chunk) => {
+                        trim_interleaved_f32_frames_front(
+                            &mut chunk.samples_f32,
+                            audio_pcm_channels,
+                            &mut pending_audio_frame_skip,
+                        );
+                        if chunk.samples_f32.is_empty() {
+                            continue;
+                        }
+                        audio_samples_total += chunk.samples_f32.len() as u64;
+                        if let Some(wav) = audio_wav.as_mut() {
+                            wav.write_f32_interleaved(&chunk.samples_f32)
+                                .context("shutdown drain: audio.wav")?;
+                        }
+                        if let Some(enc) = aac_enc.as_mut() {
+                            let aus = enc
+                                .push_interleaved_f32(&chunk.samples_f32)
+                                .context("shutdown drain: AAC encode")?;
+                            for au in aus {
+                                mp4
+                                    .write_aac_access_unit(&au, 1024)
+                                    .context("shutdown drain: MP4 AAC")?;
+                            }
+                        }
+                    }
+                    AudioMsg::Error(e) => warn!("audio thread (shutdown drain): {e}"),
+                    AudioMsg::Ready { .. } => {}
+                }
+            }
+        }
+    }
+    if let Some(j) = audio_thread.take() {
+        let _ = j.join();
     }
 
     if let Some(enc) = aac_enc.as_mut() {
@@ -325,4 +471,29 @@ fn wall_duration_to_ts_units(d: Duration, timescale_hz: u32) -> u32 {
         .saturating_mul(u64::from(timescale_hz))
         .saturating_div(1_000_000);
     u32::try_from(v).unwrap_or(u32::MAX).max(1)
+}
+
+/// Whole PCM frames (one time slot across all channels) to drop for a wall-clock duration.
+fn wall_duration_to_pcm_frames(d: Duration, sample_rate: u32) -> u64 {
+    let nanos = d.as_nanos().min(u128::from(u64::MAX) as u128);
+    (nanos
+        .saturating_mul(u128::from(sample_rate))
+        / 1_000_000_000) as u64
+}
+
+fn trim_interleaved_f32_frames_front(
+    samples: &mut Vec<f32>,
+    channels: u16,
+    skip_frames: &mut u64,
+) {
+    let ch = channels as usize;
+    if ch == 0 || samples.is_empty() || *skip_frames == 0 {
+        return;
+    }
+    let frame_count = samples.len() / ch;
+    let take = (*skip_frames as usize).min(frame_count);
+    if take > 0 {
+        samples.drain(0..take * ch);
+        *skip_frames = skip_frames.saturating_sub(take as u64);
+    }
 }

@@ -89,6 +89,7 @@ dependencies = [
  "audio",
  "audio_encoder",
  "capture",
+ "crossbeam-channel",
  "ctrlc",
  "encoder",
  "output",
