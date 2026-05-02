@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow.workspace = true
+openh264 = { version = "0.9", default-features = true }
+tracing.workspace = true
+
