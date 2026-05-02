@@ -19,6 +19,22 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 const FPS: u32 = 30;
 
+#[derive(Clone, Copy, Debug)]
+enum UvOrder {
+    Uv,
+    Vu,
+}
+
+impl UvOrder {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "uv" => Ok(Self::Uv),
+            "vu" => Ok(Self::Vu),
+            _ => anyhow::bail!("invalid UV order '{s}', expected 'uv' or 'vu'"),
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -34,6 +50,16 @@ fn main() -> anyhow::Result<()> {
     let out_dir = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "capture_out".to_string());
+    let frame_count: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(300);
+    anyhow::ensure!(frame_count > 0, "frame_count must be > 0");
+    let uv_order = UvOrder::parse(
+        &std::env::args()
+            .nth(3)
+            .unwrap_or_else(|| "vu".to_string()),
+    )?;
     std::fs::create_dir_all(&out_dir).with_context(|| format!("create_dir_all {out_dir}"))?;
 
     info!("Creating D3D11 device…");
@@ -47,15 +73,21 @@ fn main() -> anyhow::Result<()> {
 
     let mut saved: u32 = 0;
     let started = Instant::now();
-    let deadline = Duration::from_secs(120);
+    let deadline = Duration::from_secs(u64::from(frame_count).saturating_mul(2) / u64::from(FPS) + 120);
 
     let mut pool_and_size: Option<(TexturePool, FrameSize)> = None;
     let mut video_enc: Option<Box<dyn VideoEncoder>> = None;
     let mut h264_out: Option<std::fs::File> = None;
+    let mut mp4_out: Option<output::Mp4H264File> = None;
 
-    while saved < 10 {
+    info!(
+        "Capturing {} frames at {} FPS (UV order: {:?})",
+        frame_count, FPS, uv_order
+    );
+
+    while saved < frame_count {
         if started.elapsed() > deadline {
-            anyhow::bail!("timed out waiting for 10 frames (got {saved})");
+            anyhow::bail!("timed out waiting for {frame_count} frames (got {saved})");
         }
 
         match wgc.try_next_frame() {
@@ -81,9 +113,19 @@ fn main() -> anyhow::Result<()> {
                         std::fs::File::create(&path)
                             .with_context(|| format!("create {path}"))?,
                     );
+                    let mp4_path = format!("{out_dir}/clip.mp4");
+                    mp4_out = Some(
+                        output::Mp4H264File::create(
+                            &mp4_path,
+                            size.width as u16,
+                            size.height as u16,
+                            FPS,
+                        )
+                        .with_context(|| format!("create {mp4_path}"))?,
+                    );
                     info!(
-                        "GPU NV12 pool + OpenH264 Annex-B output at {}x{} → {path}",
-                        size.width, size.height
+                        "GPU NV12 pool + OpenH264 at {}x{} → {} (Annex-B) + {} (MP4 avc1)",
+                        size.width, size.height, path, mp4_path
                     );
                 }
 
@@ -138,7 +180,18 @@ fn main() -> anyhow::Result<()> {
                     info!("Wrote {uv_path} (Cb/Cr as R/G)");
                 }
 
-                let i420 = encoder::nv12_readback_to_i420(&y_bytes, &uv_bytes, w, h)
+                let uv_for_encode = match uv_order {
+                    UvOrder::Uv => uv_bytes.clone(),
+                    UvOrder::Vu => {
+                        let mut swapped = uv_bytes.clone();
+                        for pair in swapped.chunks_exact_mut(2) {
+                            pair.swap(0, 1);
+                        }
+                        swapped
+                    }
+                };
+
+                let i420 = encoder::nv12_readback_to_i420(&y_bytes, &uv_for_encode, w, h)
                     .context("nv12_readback_to_i420")?;
                 let ts_us = u64::from(saved) * 1_000_000 / u64::from(FPS);
                 let pkt = video_enc
@@ -151,6 +204,11 @@ fn main() -> anyhow::Result<()> {
                     .unwrap()
                     .write_all(&pkt.data)
                     .context("write clip.h264")?;
+                mp4_out
+                    .as_mut()
+                    .unwrap()
+                    .write_annex_b_frame(&pkt.data, pkt.is_keyframe)
+                    .context("write clip.mp4")?;
 
                 pool.release(targets);
 
@@ -163,6 +221,13 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!("Done — PNGs + nv12 debug + {out_dir}/clip.h264 (Annex-B, OpenH264)");
+    if let Some(m) = mp4_out {
+        m.finish().context("finalize clip.mp4")?;
+    }
+
+    info!(
+        "Done — PNGs + nv12 debug + {out_dir}/clip.h264 + {out_dir}/clip.mp4 (OpenH264), {} frames",
+        frame_count
+    );
     Ok(())
 }

@@ -83,6 +83,7 @@ dependencies = [
  "capture",
  "encoder",
  "image",
+ "output",
  "pipeline",
  "tracing",
  "tracing-subscriber",
@@ -356,7 +357,10 @@ dependencies = [
 name = "output"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "bytes",
  "mp4",
+ "tracing",
 ]
 
 [[package]]

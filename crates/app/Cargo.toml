@@ -12,6 +12,7 @@ anyhow.workspace = true
 capture = { path = "../capture" }
 pipeline = { path = "../pipeline" }
 encoder = { path = "../encoder" }
+output = { path = "../output" }
 windows.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 tracing.workspace = true

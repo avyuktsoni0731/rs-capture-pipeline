@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::{Seek, Write};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -16,7 +15,6 @@ pub struct Mp4H264File {
     writer: Mp4Writer<File>,
     width: u16,
     height: u16,
-    fps: u32,
     timescale: u32,
     frame_duration: u32,
     track_added: bool,
@@ -50,7 +48,6 @@ impl Mp4H264File {
             writer,
             width,
             height,
-            fps,
             timescale,
             frame_duration,
             track_added: false,
