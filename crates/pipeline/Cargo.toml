@@ -2,5 +2,10 @@
 name = "pipeline"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+windows.workspace = true

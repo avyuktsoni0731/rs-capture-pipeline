@@ -11,17 +11,24 @@ members = [
 ]
 
 [workspace.dependencies]
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
   "Win32_Graphics_Direct3D11",
   "Win32_Graphics_Direct3D",
   "Win32_Graphics_Dxgi",
   "Win32_Graphics_Dxgi_Common",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_Media_MediaFoundation",
+  "Win32_Devices_Properties",
   "Graphics_Capture",
   "Graphics_DirectX",
   "Graphics_DirectX_Direct3D11",
   "Graphics_Display",
   "Win32_System_WinRT_Direct3D11",
   "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_System_Threading",
   "Win32_Foundation",
 ] }
 tokio = { version = "1", features = ["full"] }
@@ -33,3 +40,7 @@ anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Patched `nvenc`: EOS flush with a real bitstream pointer + infallible `Drop` (upstream unwraps on destroy).
+[patch.crates-io]
+nvenc = { path = "vendor/nvenc" }

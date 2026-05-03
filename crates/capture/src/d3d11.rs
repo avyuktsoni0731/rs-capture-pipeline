@@ -1,9 +1,11 @@
 use anyhow::Context;
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_MAP_READ,
     D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Device,
     ID3D11DeviceContext, ID3D11Texture2D, D3D11CreateDevice, D3D11_SDK_VERSION,
 };
@@ -25,8 +27,8 @@ pub fn create_d3d11_device() -> anyhow::Result<D3d11Context> {
         D3D11CreateDevice(
             None,
             D3D_DRIVER_TYPE_HARDWARE,
-            None,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            HMODULE(std::ptr::null_mut()),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             Some(&levels),
             D3D11_SDK_VERSION,
             Some(&mut device),
