@@ -16,7 +16,7 @@ pub struct EncodedPacket {
     pub codec: VideoCodec,
 }
 
-/// Encoder configuration (subset of `CURSOR_CONTEXT.md` — extend as needed).
+/// Encoder configuration width/height/fps/bitrate (see workspace `CURSOR_CONTEXT.md`).
 #[derive(Clone, Debug)]
 pub struct EncoderConfig {
     pub width: u32,
