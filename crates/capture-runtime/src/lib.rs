@@ -30,12 +30,15 @@ mod run_win;
 pub use config::{
     stream_pair, AudioCodecChoice, OutputTarget, SessionConfig, VideoCodecPreference,
 };
-pub use env::{log_pipeline_startup, pipeline_params_from_cli_and_env};
+pub use env::{
+    log_pipeline_startup, pipeline_params_files_and_stream, pipeline_params_from_cli_and_env,
+    pipeline_params_stream_only,
+};
 pub use error::RuntimeError;
 pub use events::{AudioChunk, StreamClock, VideoPacket};
-pub use params::{PipelineParams, RunStats};
+pub use params::{PipelineParams, RecordingOutputs, RunStats};
 
-/// Run a full **file** recording session (WGC → encode → `clip.mp4` / `clip.h264` / `audio.wav`).
+/// Run a recording session (WGC → encode → optional disk + optional [`RecordingOutputs::Stream`]).
 ///
 /// **Windows only.** Call after COM init on the main thread if you use audio/MF (see CLI binary).
 #[cfg(windows)]

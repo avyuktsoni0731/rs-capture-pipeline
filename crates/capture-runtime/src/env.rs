@@ -4,11 +4,25 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
-use crate::params::PipelineParams;
+use crate::params::{PipelineParams, RecordingOutputs};
 
-/// Build [`PipelineParams`] from CLI arguments plus `RS_CAPTURE_*` env overrides.
+/// Build [`PipelineParams`] from CLI arguments plus `RS_CAPTURE_*` env overrides (file output only).
 pub fn pipeline_params_from_cli_and_env(
     output_directory: impl Into<PathBuf>,
+    frame_limit: u32,
+    capture_system_audio: bool,
+) -> PipelineParams {
+    build_pipeline_params(
+        RecordingOutputs::Files {
+            directory: output_directory.into(),
+        },
+        frame_limit,
+        capture_system_audio,
+    )
+}
+
+fn build_pipeline_params(
+    outputs: RecordingOutputs,
     frame_limit: u32,
     capture_system_audio: bool,
 ) -> PipelineParams {
@@ -24,7 +38,7 @@ pub fn pipeline_params_from_cli_and_env(
     let remux_with_ffmpeg = std::env::var("RS_CAPTURE_FFMPEG_MUX").ok().as_deref() == Some("1");
 
     PipelineParams {
-        output_directory: output_directory.into(),
+        outputs,
         frame_limit,
         capture_system_audio,
         fps,
@@ -38,8 +52,58 @@ pub fn pipeline_params_from_cli_and_env(
     }
 }
 
+/// Stream-only session (e.g. MyCord host created channels via [`crate::stream_pair`]).
+pub fn pipeline_params_stream_only(
+    video_tx: crossbeam_channel::Sender<crate::events::VideoPacket>,
+    audio_tx: crossbeam_channel::Sender<crate::events::AudioChunk>,
+    frame_limit: u32,
+    capture_system_audio: bool,
+) -> PipelineParams {
+    build_pipeline_params(
+        RecordingOutputs::Stream {
+            video_tx,
+            audio_tx,
+        },
+        frame_limit,
+        capture_system_audio,
+    )
+}
+
+/// Record to disk and duplicate encoded packets to `video_tx` / `audio_tx`.
+pub fn pipeline_params_files_and_stream(
+    directory: impl Into<PathBuf>,
+    video_tx: crossbeam_channel::Sender<crate::events::VideoPacket>,
+    audio_tx: crossbeam_channel::Sender<crate::events::AudioChunk>,
+    frame_limit: u32,
+    capture_system_audio: bool,
+) -> PipelineParams {
+    build_pipeline_params(
+        RecordingOutputs::FilesAndStream {
+            directory: directory.into(),
+            video_tx,
+            audio_tx,
+        },
+        frame_limit,
+        capture_system_audio,
+    )
+}
+
 /// Log effective capture settings (call from the binary after building params).
 pub fn log_pipeline_startup(p: &PipelineParams) {
+    match &p.outputs {
+        RecordingOutputs::Files { directory } => {
+            info!("Output: files under {}", directory.display());
+        }
+        RecordingOutputs::Stream { .. } => {
+            info!("Output: stream-only (no clip.h264 / clip.mp4 / audio.wav on disk)");
+        }
+        RecordingOutputs::FilesAndStream { directory, .. } => {
+            info!(
+                "Output: files under {} + duplicate packet stream",
+                directory.display()
+            );
+        }
+    }
     if p.fps != 30 {
         info!(
             "RS_CAPTURE_FPS={}: encoder and MP4 use this nominal rate (default 30)",

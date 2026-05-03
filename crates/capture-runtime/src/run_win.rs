@@ -20,6 +20,7 @@ use pipeline::{
 };
 use audio_encoder::MfAacLcEncoder;
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use crate::events::{AudioChunk, VideoPacket};
 use crate::params::{PipelineParams, RunStats};
 use tracing::{debug, info, warn};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
@@ -76,12 +77,13 @@ pub(crate) fn run_file_recording(
     params: &PipelineParams,
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<RunStats> {
-    std::fs::create_dir_all(&params.output_directory).with_context(|| {
-        format!(
-            "create_dir_all {}",
-            params.output_directory.display()
-        )
-    })?;
+    if let Some(dir) = params.outputs.directory() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create_dir_all {}", dir.display()))?;
+    }
+
+    let mut stream_video_packets_sent: u64 = 0;
+    let mut stream_audio_chunks_sent: u64 = 0;
 
     info!("Creating D3D11 device…");
     let D3d11Context { device, context } = create_d3d11_device()?;
@@ -153,7 +155,7 @@ pub(crate) fn run_file_recording(
                         params.fps,
                         params.video_bitrate_bps,
                     );
-                    video_enc = Some(encoder::create_best_encoder(Some(&device), &enc_cfg_boot)?);
+                    video_enc = Some(encoder::create_windows_encoder(Some(&device), &enc_cfg_boot)?);
 
                     if video_enc
                         .as_ref()
@@ -185,29 +187,35 @@ pub(crate) fn run_file_recording(
                         );
                     }
 
-                    let h264_path = params.output_directory.join("clip.h264");
-                    h264_out = Some(
-                        std::fs::File::create(&h264_path).with_context(|| {
+                    if params.outputs.writes_video_files() {
+                        let dir = params.outputs.directory().expect("writes_video_files implies dir");
+                        let h264_path = dir.join("clip.h264");
+                        h264_out = Some(std::fs::File::create(&h264_path).with_context(|| {
                             format!("create {}", h264_path.display())
-                        })?,
-                    );
-                    let mp4_path = params.output_directory.join("clip.mp4");
-                    mp4_out = Some(
-                        output::Mp4H264File::create(
-                            &mp4_path,
-                            size.width as u16,
-                            size.height as u16,
-                            params.fps,
-                        )
-                        .with_context(|| format!("create {}", mp4_path.display()))?,
-                    );
-                    info!(
-                        "GPU NV12 pool at {}x{} → {} (Annex-B) + {} (MP4 avc1); encoder selected at startup (NVENC uses GPU BGRA when available)",
-                        size.width,
-                        size.height,
-                        h264_path.display(),
-                        mp4_path.display()
-                    );
+                        })?);
+                        let mp4_path = dir.join("clip.mp4");
+                        mp4_out = Some(
+                            output::Mp4H264File::create(
+                                &mp4_path,
+                                size.width as u16,
+                                size.height as u16,
+                                params.fps,
+                            )
+                            .with_context(|| format!("create {}", mp4_path.display()))?,
+                        );
+                        info!(
+                            "GPU NV12 pool at {}x{} → {} (Annex-B) + {} (MP4 avc1); encoder at startup (NVENC uses GPU BGRA when available)",
+                            size.width,
+                            size.height,
+                            h264_path.display(),
+                            mp4_path.display()
+                        );
+                    } else {
+                        info!(
+                            "GPU NV12 pool at {}x{}; stream output (no clip.h264 / clip.mp4 on disk)",
+                            size.width, size.height
+                        );
+                    }
                 }
 
                 let (pool, size) = pool_and_size.as_ref().unwrap();
@@ -252,7 +260,10 @@ pub(crate) fn run_file_recording(
 
                 // Start loopback **after** the first wall-clock anchor so PTS 0 matches frame 0,
                 // and so we do not accumulate a second of preroll in the WASAPI ring buffer.
-                if first_wall_anchor && params.capture_system_audio && audio_rx.is_none() {
+                let want_encoded_audio =
+                    mp4_out.is_some() || params.outputs.stream_senders().is_some();
+                if first_wall_anchor && params.capture_system_audio && want_encoded_audio && audio_rx.is_none()
+                {
                     let (tx, rx) = unbounded::<AudioMsg>();
                     let stop_a = Arc::clone(&stop);
                     let join = std::thread::spawn(move || audio_loopback_thread(stop_a, tx));
@@ -269,17 +280,22 @@ pub(crate) fn run_file_recording(
                                 "WASAPI format: {} Hz, {} ch, {} bits (dedicated capture thread)",
                                 sample_rate, channels, bits_per_sample
                             );
-                            let wav_path = params
-                                .output_directory
-                                .join("audio.wav");
-                            audio_wav = Some(
-                                audio::WavFileWriter::create(&wav_path, sample_rate, channels)
-                                    .with_context(|| format!("create {}", wav_path.display()))?,
-                            );
-                            info!(
-                                "Writing system audio to WAV: {}",
-                                wav_path.display()
-                            );
+                            audio_wav = if let Some(dir) = params.outputs.directory() {
+                                let wav_path = dir.join("audio.wav");
+                                info!(
+                                    "Writing system audio to WAV: {}",
+                                    wav_path.display()
+                                );
+                                Some(
+                                    audio::WavFileWriter::create(&wav_path, sample_rate, channels)
+                                        .with_context(|| {
+                                            format!("create {}", wav_path.display())
+                                        })?,
+                                )
+                            } else {
+                                info!("Stream-only: WAV debug file skipped");
+                                None
+                            };
                             let aac_br = 128_000u32;
                             match MfAacLcEncoder::new(sample_rate, channels, aac_br) {
                                 Ok(enc) => {
@@ -289,7 +305,11 @@ pub(crate) fn run_file_recording(
                                             .with_context(|| "Mp4H264File::enable_aac")?;
                                     }
                                     aac_enc = Some(enc);
-                                    info!("In-process AAC (MF AAC-LC) muxed into clip.mp4");
+                                    if mp4_out.is_some() {
+                                        info!("In-process AAC (MF AAC-LC) muxed into clip.mp4");
+                                    } else {
+                                        info!("In-process AAC (MF AAC-LC) for stream output");
+                                    }
                                 }
                                 Err(e) => {
                                     warn!(
@@ -423,8 +443,10 @@ pub(crate) fn run_file_recording(
                         .encode_i420(&i420, ts_us)
                         .context("encode_i420")?
                 };
-                let mp4 = mp4_out.as_mut().unwrap();
-                let v_ts = mp4.video_timescale();
+                let v_ts = mp4_out
+                    .as_ref()
+                    .map(|m| m.video_timescale())
+                    .unwrap_or(30_000u32);
                 let nominal = std::cmp::max(1u32, v_ts / params.fps);
                 let max_dur = nominal.saturating_mul(10);
                 let gap_ts = if saved == 0 {
@@ -434,34 +456,42 @@ pub(crate) fn run_file_recording(
                 };
                 last_ts_us = ts_us;
 
-                let h264 = h264_out.as_mut().unwrap();
-                if params.cfr_mux {
+                let (slot_count, dur_ts) = if params.cfr_mux {
                     let max_slots = params.fps.saturating_mul(600).max(1);
-                    let slots_u64 = (u64::from(gap_ts) + u64::from(nominal) - 1) / u64::from(nominal);
+                    let slots_u64 =
+                        (u64::from(gap_ts) + u64::from(nominal) - 1) / u64::from(nominal);
                     let slots = u32::try_from(slots_u64.max(1))
                         .unwrap_or(u32::MAX)
                         .min(max_slots);
-                    for slot_idx in 0..slots {
-                        let key = pkt.is_keyframe && slot_idx == 0;
+                    (slots, nominal)
+                } else {
+                    (1u32, gap_ts)
+                };
+
+                for slot_idx in 0..slot_count {
+                    let key = pkt.is_keyframe && slot_idx == 0;
+                    if let Some(h264) = h264_out.as_mut() {
                         h264
                             .write_all(&pkt.data)
                             .context("write clip.h264")?;
-                        mp4
-                            .write_annex_b_frame_with_duration(&pkt.data, key, nominal)
-                            .context("write clip.mp4 (CFR)")?;
-                        muxed_video_duration_ts =
-                            muxed_video_duration_ts.saturating_add(u64::from(nominal));
                     }
-                } else {
-                    let duration_ts = gap_ts;
-                    h264
-                        .write_all(&pkt.data)
-                        .context("write clip.h264")?;
-                    mp4
-                        .write_annex_b_frame_with_duration(&pkt.data, pkt.is_keyframe, duration_ts)
-                        .context("write clip.mp4")?;
+                    if let Some(mp4) = mp4_out.as_mut() {
+                        mp4
+                            .write_annex_b_frame_with_duration(&pkt.data, key, dur_ts)
+                            .context("write clip.mp4")?;
+                    }
+                    if let Some((vtx, _)) = params.outputs.stream_senders() {
+                        let vp = VideoPacket {
+                            annex_b: pkt.data.clone(),
+                            timestamp_us: pkt.timestamp_us,
+                            is_keyframe: key,
+                        };
+                        if vtx.send(vp).is_ok() {
+                            stream_video_packets_sent += 1;
+                        }
+                    }
                     muxed_video_duration_ts =
-                        muxed_video_duration_ts.saturating_add(u64::from(duration_ts));
+                        muxed_video_duration_ts.saturating_add(u64::from(dur_ts));
                 }
 
                 if let Some(rx) = audio_rx.as_ref() {
@@ -501,11 +531,31 @@ pub(crate) fn run_file_recording(
                                         .push_interleaved_f32(&chunk.samples_f32)
                                         .context("AAC encode")?;
                                     for au in aus {
-                                        mp4
-                                            .write_aac_access_unit(&au, 1024)
-                                            .context("write AAC to MP4")?;
+                                        let au_start = muxed_audio_samples;
                                         muxed_audio_samples =
                                             muxed_audio_samples.saturating_add(1024);
+                                        let ts_audio_us = (au_start as u128
+                                            * 1_000_000
+                                            / u128::from(audio_sample_rate))
+                                            as u64;
+                                        if let Some(mp4) = mp4_out.as_mut() {
+                                            mp4
+                                                .write_aac_access_unit(&au, 1024)
+                                                .context("write AAC to MP4")?;
+                                        }
+                                        if let Some((_, atx)) =
+                                            params.outputs.stream_senders()
+                                        {
+                                            let chunk_a = AudioChunk::AacRaw {
+                                                sample_rate: audio_sample_rate,
+                                                channels: audio_pcm_channels,
+                                                timestamp_us: ts_audio_us,
+                                                payload: au.clone(),
+                                            };
+                                            if atx.send(chunk_a).is_ok() {
+                                                stream_audio_chunks_sent += 1;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -572,66 +622,84 @@ pub(crate) fn run_file_recording(
 
     stop.store(true, Ordering::SeqCst);
     if let Some(rx) = audio_rx.take() {
-        if let Some(mp4) = mp4_out.as_mut() {
-            let v_ts_shutdown = mp4.video_timescale();
-            for msg in rx.try_iter() {
-                match msg {
-                    AudioMsg::Chunk(mut chunk) => {
-                        let trimmed = trim_interleaved_f32_frames_front(
-                            &mut chunk.samples_f32,
-                            audio_pcm_channels,
-                            &mut pending_audio_frame_skip,
-                        );
-                        let prepended = prepend_silence_pcm_frames_front(
-                            &mut chunk.samples_f32,
-                            audio_pcm_channels,
-                            &mut pending_silence_pcm_frames,
-                        );
-                        smooth_pcm_chunk_edges(
-                            &mut chunk.samples_f32,
-                            audio_pcm_channels,
-                            prepended,
-                            trimmed,
-                        );
-                        if chunk.samples_f32.is_empty() {
-                            continue;
-                        }
-                        audio_samples_total += chunk.samples_f32.len() as u64;
-                        if let Some(wav) = audio_wav.as_mut() {
-                            wav.write_f32_interleaved(&chunk.samples_f32)
-                                .context("shutdown drain: audio.wav")?;
-                        }
-                        if let Some(enc) = aac_enc.as_mut() {
-                            let aus = enc
-                                .push_interleaved_f32(&chunk.samples_f32)
-                                .context("shutdown drain: AAC encode")?;
-                            for au in aus {
+        let v_ts_shutdown = mp4_out
+            .as_ref()
+            .map(|m| m.video_timescale())
+            .unwrap_or(30_000u32);
+        for msg in rx.try_iter() {
+            match msg {
+                AudioMsg::Chunk(mut chunk) => {
+                    let trimmed = trim_interleaved_f32_frames_front(
+                        &mut chunk.samples_f32,
+                        audio_pcm_channels,
+                        &mut pending_audio_frame_skip,
+                    );
+                    let prepended = prepend_silence_pcm_frames_front(
+                        &mut chunk.samples_f32,
+                        audio_pcm_channels,
+                        &mut pending_silence_pcm_frames,
+                    );
+                    smooth_pcm_chunk_edges(
+                        &mut chunk.samples_f32,
+                        audio_pcm_channels,
+                        prepended,
+                        trimmed,
+                    );
+                    if chunk.samples_f32.is_empty() {
+                        continue;
+                    }
+                    audio_samples_total += chunk.samples_f32.len() as u64;
+                    if let Some(wav) = audio_wav.as_mut() {
+                        wav.write_f32_interleaved(&chunk.samples_f32)
+                            .context("shutdown drain: audio.wav")?;
+                    }
+                    if let Some(enc) = aac_enc.as_mut() {
+                        let aus = enc
+                            .push_interleaved_f32(&chunk.samples_f32)
+                            .context("shutdown drain: AAC encode")?;
+                        for au in aus {
+                            let au_start = muxed_audio_samples;
+                            muxed_audio_samples =
+                                muxed_audio_samples.saturating_add(1024);
+                            let ts_audio_us = (au_start as u128 * 1_000_000
+                                / u128::from(audio_sample_rate))
+                                as u64;
+                            if let Some(mp4) = mp4_out.as_mut() {
                                 mp4
                                     .write_aac_access_unit(&au, 1024)
                                     .context("shutdown drain: MP4 AAC")?;
-                                muxed_audio_samples =
-                                    muxed_audio_samples.saturating_add(1024);
+                            }
+                            if let Some((_, atx)) = params.outputs.stream_senders() {
+                                let chunk_a = AudioChunk::AacRaw {
+                                    sample_rate: audio_sample_rate,
+                                    channels: audio_pcm_channels,
+                                    timestamp_us: ts_audio_us,
+                                    payload: au.clone(),
+                                };
+                                if atx.send(chunk_a).is_ok() {
+                                    stream_audio_chunks_sent += 1;
+                                }
                             }
                         }
                     }
-                    AudioMsg::Error(e) => warn!("audio thread (shutdown drain): {e}"),
-                    AudioMsg::Ready { .. } => {}
                 }
+                AudioMsg::Error(e) => warn!("audio thread (shutdown drain): {e}"),
+                AudioMsg::Ready { .. } => {}
             }
-            if params.av_drift_threshold_pcm_frames > 0
-                && audio_sample_rate > 0
-                && aac_enc.is_some()
-            {
-                reconcile_mux_av_drift(
-                    muxed_video_duration_ts,
-                    muxed_audio_samples,
-                    v_ts_shutdown,
-                    audio_sample_rate,
-                    params.av_drift_threshold_pcm_frames,
-                    &mut pending_silence_pcm_frames,
-                    &mut pending_audio_frame_skip,
-                );
-            }
+        }
+        if params.av_drift_threshold_pcm_frames > 0
+            && audio_sample_rate > 0
+            && aac_enc.is_some()
+        {
+            reconcile_mux_av_drift(
+                muxed_video_duration_ts,
+                muxed_audio_samples,
+                v_ts_shutdown,
+                audio_sample_rate,
+                params.av_drift_threshold_pcm_frames,
+                &mut pending_silence_pcm_frames,
+                &mut pending_audio_frame_skip,
+            );
         }
     }
     if let Some(j) = audio_thread.take() {
@@ -639,12 +707,26 @@ pub(crate) fn run_file_recording(
     }
 
     if let Some(enc) = aac_enc.as_mut() {
-        if let Some(mp4) = mp4_out.as_mut() {
-            for au in enc.flush().context("AAC flush")? {
+        for au in enc.flush().context("AAC flush")? {
+            let au_start = muxed_audio_samples;
+            muxed_audio_samples = muxed_audio_samples.saturating_add(1024);
+            let ts_audio_us =
+                (au_start as u128 * 1_000_000 / u128::from(audio_sample_rate)) as u64;
+            if let Some(mp4) = mp4_out.as_mut() {
                 mp4
                     .write_aac_access_unit(&au, 1024)
                     .context("write final AAC samples")?;
-                muxed_audio_samples = muxed_audio_samples.saturating_add(1024);
+            }
+            if let Some((_, atx)) = params.outputs.stream_senders() {
+                let chunk_a = AudioChunk::AacRaw {
+                    sample_rate: audio_sample_rate,
+                    channels: audio_pcm_channels,
+                    timestamp_us: ts_audio_us,
+                    payload: au.clone(),
+                };
+                if atx.send(chunk_a).is_ok() {
+                    stream_audio_chunks_sent += 1;
+                }
             }
         }
     }
@@ -656,9 +738,10 @@ pub(crate) fn run_file_recording(
     }
 
     if params.capture_system_audio && params.remux_with_ffmpeg {
-        let video_mp4 = params.output_directory.join("clip.mp4");
-        let audio_wav = params.output_directory.join("audio.wav");
-        let muxed_mp4 = params.output_directory.join("clip_with_audio.mp4");
+        if let Some(dir) = params.outputs.directory() {
+        let video_mp4 = dir.join("clip.mp4");
+        let audio_wav = dir.join("audio.wav");
+        let muxed_mp4 = dir.join("clip_with_audio.mp4");
         match try_mux_with_ffmpeg(
             video_mp4
                 .to_str()
@@ -674,18 +757,30 @@ pub(crate) fn run_file_recording(
             Ok(false) => info!("RS_CAPTURE_FFMPEG_MUX set but ffmpeg not found"),
             Err(e) => info!("RS_CAPTURE_FFMPEG_MUX: ffmpeg failed ({e})"),
         }
+        }
     }
 
+    let done_files = match params.outputs.directory() {
+        Some(dir) => format!(
+            "{}clip.h264 + {}clip.mp4",
+            dir.display(),
+            dir.display()
+        ),
+        None => "(no files)".to_string(),
+    };
     info!(
-        "Done — {}clip.h264 + {}clip.mp4, frames={}, audio_samples={}",
-        params.output_directory.display(),
-        params.output_directory.display(),
+        "Done — {}, frames={}, audio_samples={}, stream_video_packets={}, stream_audio_chunks={}",
+        done_files,
         saved,
-        audio_samples_total
+        audio_samples_total,
+        stream_video_packets_sent,
+        stream_audio_chunks_sent
     );
     Ok(RunStats {
         frames_captured: saved,
         audio_samples_total,
+        stream_video_packets_sent,
+        stream_audio_chunks_sent,
     })
 }
 

@@ -4,9 +4,11 @@ mod annex_b;
 mod i420;
 mod nvenc;
 mod openh264_enc;
+pub mod registry;
 mod traits;
 
 pub use i420::nv12_readback_to_i420;
+pub use registry::create_windows_encoder;
 pub use openh264_enc::OpenH264VideoEncoder;
 pub use traits::{EncodedPacket, EncoderConfig, VideoCodec, VideoEncoder};
 

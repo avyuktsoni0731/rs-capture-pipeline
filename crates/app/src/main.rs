@@ -61,8 +61,12 @@ fn main() -> anyhow::Result<()> {
     let stats = run_file_recording(&params, stop)?;
     let elapsed = t0.elapsed().as_secs_f64();
     info!(
-        "Finished in {:.1}s — {} frames, {} PCM samples",
-        elapsed, stats.frames_captured, stats.audio_samples_total
+        "Finished in {:.1}s — {} frames, {} PCM samples (stream out: {} video pkts, {} audio chunks)",
+        elapsed,
+        stats.frames_captured,
+        stats.audio_samples_total,
+        stats.stream_video_packets_sent,
+        stats.stream_audio_chunks_sent
     );
     Ok(())
 }
