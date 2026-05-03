@@ -39,7 +39,7 @@ macro_rules! stdcall {
 
 pub(crate) static LIBRARY: OnceLock<NVENCLibrary> = OnceLock::new();
 
-/// Struct containing the library handle, init and get_max_version number functions
+/// Library handle plus `NvEncodeAPICreateInstance` / `NvEncodeAPIGetMaxSupportedVersion` entry points.
 pub struct NVENCLibrary {
     #[allow(unused)]
     // Lib must stay alive for nvenc to be used
@@ -76,11 +76,11 @@ impl NVENCLibrary {
         Ok(unsafe { list.assume_init() })
     }
 
-    pub fn get_max_version(&self) -> Result<u32, NVencError> {
-        let mut version = 0;
+    /// Raw value from `NvEncodeAPIGetMaxSupportedVersion`: **4 LSB = minor**, upper bits = major
+    /// (NVIDIA Video Codec SDK). Do not mangle; use for `(major<<4)|minor` comparisons only.
+    pub fn max_supported_version_packed(&self) -> Result<u32, NVencError> {
+        let mut version = 0u32;
         unsafe { (self.get_max_version)(&raw mut version) }.into_error()?;
-        let minor = version & 0x0F;
-        let version = (version >> 4) | minor << 28;
         Ok(version)
     }
 }

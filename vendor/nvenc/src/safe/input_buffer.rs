@@ -52,9 +52,11 @@ impl InputBufferLock<'_> {
 
 impl Drop for InputBufferLock<'_> {
     fn drop(&mut self) {
+        // NvEncUnlockInputBuffer expects the NV_ENC_INPUT_PTR from NvEncCreateInputBuffer, not
+        // bufferDataPtr from NvEncLockInputBuffer (see NVIDIA Video Codec SDK headers).
         let _ = self
             .input_buffer
             .encoder
-            .unlock_input_buffer(self.lock_ptr);
+            .unlock_input_buffer(self.input_buffer.buffer);
     }
 }

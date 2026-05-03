@@ -1,4 +1,5 @@
-//! NVIDIA NVENC H.264 via D3D11 session (`nvenc` crate). Feeds I420 by copying into a host IYUV input buffer.
+//! NVIDIA NVENC H.264 via D3D11: **registered DX11 texture** + `encode_picture` (same pattern as
+//! NVIDIA samples / OBS), not host IYUV `NvEncCreateInputBuffer`.
 
 use std::mem::ManuallyDrop;
 
@@ -6,15 +7,15 @@ use anyhow::Context;
 use nvenc::bitstream::BitStream;
 use nvenc::session::{InitParams, Session};
 use nvenc::sys::enums::{
-    NVencBufferFormat, NVencMemoryHeap, NVencParamsRcMode, NVencPicStruct, NVencPicType,
-    NVencTuningInfo,
+    NVencBufferFormat, NVencParamsRcMode, NVencPicStruct, NVencPicType, NVencTuningInfo,
 };
 use nvenc::sys::guids::{
     NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P2_GUID, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P4_GUID,
 };
 use nvenc::sys::result::NVencError;
 use nvenc::sys::structs::Guid;
-use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 
 use crate::traits::{EncodedPacket, VideoCodec, VideoEncoder};
 
@@ -25,66 +26,6 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
         a = t;
     }
     a
-}
-
-/// Copy tightly packed I420 (`Y`, then `U`, then `V`) into NVENC IYUV host buffer layout for lock pitch `pitch`.
-unsafe fn copy_i420_to_nvenc_iyuv(
-    i420: &[u8],
-    dst: *mut u8,
-    width: u32,
-    height: u32,
-    pitch: u32,
-) -> anyhow::Result<()> {
-    let w = width as usize;
-    let h = height as usize;
-    let y_sz = w * h;
-    let c_w = w / 2;
-    let c_h = h / 2;
-    let c_sz = c_w * c_h;
-    anyhow::ensure!(
-        i420.len() >= y_sz + 2 * c_sz,
-        "I420 buffer too small for {}x{}",
-        width,
-        height
-    );
-
-    let pitch = pitch as usize;
-    let chroma_pitch = pitch / 2;
-    anyhow::ensure!(
-        pitch >= w && chroma_pitch >= c_w,
-        "NVENC pitch {} too small for width {}",
-        pitch,
-        width
-    );
-
-    for row in 0..h {
-        let src = i420[row * w..row * w + w].as_ptr();
-        let d = dst.add(row * pitch);
-        std::ptr::copy_nonoverlapping(src, d, w);
-    }
-
-    let u_src = &i420[y_sz..y_sz + c_sz];
-    let v_src = &i420[y_sz + c_sz..y_sz + 2 * c_sz];
-    let y_plane_bytes = pitch * h;
-    let mut u_dst = dst.add(y_plane_bytes);
-    let mut v_dst = dst.add(y_plane_bytes + chroma_pitch * c_h);
-
-    for row in 0..c_h {
-        std::ptr::copy_nonoverlapping(
-            u_src[row * c_w..row * c_w + c_w].as_ptr(),
-            u_dst,
-            c_w,
-        );
-        std::ptr::copy_nonoverlapping(
-            v_src[row * c_w..row * c_w + c_w].as_ptr(),
-            v_dst,
-            c_w,
-        );
-        u_dst = u_dst.add(chroma_pitch);
-        v_dst = v_dst.add(chroma_pitch);
-    }
-
-    Ok(())
 }
 
 fn pick_h264_preset(codecs: &[Guid], presets: &[Guid]) -> anyhow::Result<Guid> {
@@ -104,11 +45,12 @@ fn pick_h264_preset(codecs: &[Guid], presets: &[Guid]) -> anyhow::Result<Guid> {
     anyhow::bail!("no supported NVENC H.264 preset (P2–P4)")
 }
 
-/// `ManuallyDrop` + custom [`Drop`] so we can EOS-flush with a valid bitstream, then free resources
-/// in a driver-friendly order (see workspace `vendor/nvenc` patch).
+/// `ManuallyDrop` + custom [`Drop`] so we EOS-flush with a valid bitstream, then unregister DX
+/// resources before destroying the encoder (see workspace `vendor/nvenc` patch).
 struct NvencInner {
     bitstream: ManuallyDrop<BitStream>,
-    input: ManuallyDrop<nvenc::input_buffer::InputBuffer>,
+    /// Lazily registered against the converter's internal BGRA texture; cleared before encoder destroy.
+    registered: Option<nvenc::encoder::RegisteredResource>,
     encoder: ManuallyDrop<nvenc::encoder::Encoder>,
 }
 
@@ -117,36 +59,47 @@ impl Drop for NvencInner {
         let enc: &nvenc::encoder::Encoder = &self.encoder;
         let bs: &BitStream = &self.bitstream;
         let _ = enc.flush_eos(bs);
+        self.registered = None;
         unsafe {
             ManuallyDrop::drop(&mut self.bitstream);
-            ManuallyDrop::drop(&mut self.input);
             ManuallyDrop::drop(&mut self.encoder);
         }
     }
 }
 
 /// Hardware H.264 encoder (NVENC). Requires NVIDIA driver and matching `nvEncodeAPI64.dll`.
+///
+/// Input is **BGRA** in a `ID3D11Texture2D` on the **same** `ID3D11Device` as capture (required on
+/// many drivers for `NvEncEncodePicture`).
+///
+/// `inner` is last so it is dropped first (reverse field drop order) when not using custom Drop;
+/// we use custom [`Drop`] on [`NvencInner`] for ordering.
 pub struct NvencVideoEncoder {
-    inner: NvencInner,
     width: u32,
     height: u32,
     frame_idx: usize,
     gop_frames: u32,
+    /// COM identity of the texture last passed to `register_resource_dx11` (invalidates registration when it changes).
+    registered_tex: Option<*mut std::ffi::c_void>,
+    inner: NvencInner,
 }
 
 /// Capture uses one thread for encode; the `nvenc` safe wrappers omit `Send`.
 unsafe impl Send for NvencVideoEncoder {}
 
 impl NvencVideoEncoder {
-    pub fn try_new(device: &ID3D11Device, config: &crate::EncoderConfig) -> anyhow::Result<Self> {
+    pub fn try_new(capture_device: &ID3D11Device, config: &crate::EncoderConfig) -> anyhow::Result<Self> {
         nvenc::nvenc_init().context("load nvEncodeAPI64.dll / NvEncodeAPICreateInstance")?;
 
         let width = config.width;
         let height = config.height;
-        anyhow::ensure!(width % 2 == 0 && height % 2 == 0, "NVENC I420 needs even width/height");
+        anyhow::ensure!(
+            width % 2 == 0 && height % 2 == 0,
+            "NVENC needs even width/height"
+        );
 
         let session: Session<nvenc::session::NeedsConfig> =
-            Session::open_dx(device).map_err(|e| anyhow::anyhow!("NVENC open_dx: {e:?}"))?;
+            Session::open_dx(capture_device).map_err(|e| anyhow::anyhow!("NVENC open_dx: {e:?}"))?;
 
         let codecs = session
             .get_encode_codecs()
@@ -173,6 +126,7 @@ impl NvencVideoEncoder {
         preset_config.preset_cfg.rc_params.rate_control_mode = NVencParamsRcMode::VBR;
         preset_config.preset_cfg.rc_params.average_bit_rate = config.bitrate_bps;
 
+        // Match `vendor/nvenc/examples/simple_encode.rs` (DX11 texture → register → encode).
         let init = InitParams {
             encode_guid: NV_ENC_CODEC_H264_GUID,
             preset_guid,
@@ -180,7 +134,7 @@ impl NvencVideoEncoder {
             aspect_ratio: dar,
             frame_rate: [config.fps.max(1), 1],
             tuning_info: NVencTuningInfo::LowLatency,
-            buffer_format: NVencBufferFormat::IYUV,
+            buffer_format: NVencBufferFormat::ARGB,
             encode_config: &mut preset_config.preset_cfg,
             enable_ptd: true,
             max_encoder_resolution: [0, 0],
@@ -190,40 +144,21 @@ impl NvencVideoEncoder {
             .init_encoder(init)
             .map_err(|e| anyhow::anyhow!("init_encoder: {e:?}"))?;
 
-        let input = encoder
-            .create_input_buffer(
-                width,
-                height,
-                NVencMemoryHeap::SystemUncached,
-                NVencBufferFormat::IYUV,
-            )
-            .map_err(|e| anyhow::anyhow!("create_input_buffer: {e:?}"))?;
-
-        {
-            let lock = input.lock().map_err(|e| anyhow::anyhow!("lock input (probe): {e:?}"))?;
-            let pitch = lock.pitch();
-            anyhow::ensure!(
-                pitch == width,
-                "NVENC input pitch {} != width {} (nvenc InputBuffer pitch bug risk); use OpenH264",
-                pitch,
-                width
-            );
-        }
-
         let bitstream = encoder
             .create_bitstream_buffer()
             .map_err(|e| anyhow::anyhow!("create_bitstream_buffer: {e:?}"))?;
 
         Ok(Self {
-            inner: NvencInner {
-                bitstream: ManuallyDrop::new(bitstream),
-                input: ManuallyDrop::new(input),
-                encoder: ManuallyDrop::new(encoder),
-            },
             width,
             height,
             frame_idx: 0,
             gop_frames,
+            registered_tex: None,
+            inner: NvencInner {
+                bitstream: ManuallyDrop::new(bitstream),
+                registered: None,
+                encoder: ManuallyDrop::new(encoder),
+            },
         })
     }
 
@@ -236,32 +171,54 @@ impl NvencVideoEncoder {
             }
         }
     }
+
+    fn ensure_registered(&mut self, tex: &ID3D11Texture2D) -> anyhow::Result<()> {
+        let p = tex.as_raw();
+        if self.registered_tex == Some(p) && self.inner.registered.is_some() {
+            return Ok(());
+        }
+        self.inner.registered = None;
+        self.registered_tex = None;
+
+        let pitch = self.width.saturating_mul(4);
+        let reg = self
+            .inner
+            .encoder
+            .register_resource_dx11(tex, NVencBufferFormat::ARGB, pitch)
+            .map_err(|e| anyhow::anyhow!("register_resource_dx11: {e:?}"))?;
+        self.inner.registered = Some(reg);
+        self.registered_tex = Some(p);
+        Ok(())
+    }
 }
 
 impl VideoEncoder for NvencVideoEncoder {
-    fn encode_i420(&mut self, i420: &[u8], timestamp_us: u64) -> anyhow::Result<EncodedPacket> {
-        let expected = (self.width * self.height * 3 / 2) as usize;
-        anyhow::ensure!(
-            i420.len() >= expected,
-            "I420 size {} < expected {}",
-            i420.len(),
-            expected
-        );
+    fn encode_i420(&mut self, _i420: &[u8], _timestamp_us: u64) -> anyhow::Result<EncodedPacket> {
+        anyhow::bail!(
+            "NVENC uses the GPU BGRA path (encode_bgra_texture); do not call encode_i420 for NVENC"
+        )
+    }
 
-        {
-            let lock = (&*self.inner.input)
-                .lock()
-                .map_err(|e| anyhow::anyhow!("lock input: {e:?}"))?;
-            unsafe {
-                copy_i420_to_nvenc_iyuv(
-                    &i420[..expected],
-                    lock.data_ptr(),
-                    self.width,
-                    self.height,
-                    lock.pitch(),
-                )?;
-            }
-        }
+    fn codec(&self) -> VideoCodec {
+        VideoCodec::H264
+    }
+
+    fn supports_bgra_gpu_encode(&self) -> bool {
+        true
+    }
+
+    fn encode_bgra_texture(
+        &mut self,
+        tex: &ID3D11Texture2D,
+        timestamp_us: u64,
+    ) -> anyhow::Result<EncodedPacket> {
+        self.ensure_registered(tex)?;
+
+        let reg = self
+            .inner
+            .registered
+            .as_ref()
+            .context("NVENC registered resource missing after ensure_registered")?;
 
         let force_idr = (self.frame_idx == 0)
             || (self.gop_frames > 0 && (self.frame_idx as u32) % self.gop_frames == 0);
@@ -274,11 +231,11 @@ impl VideoEncoder for NvencVideoEncoder {
         self.inner
             .encoder
             .encode_picture(
-                &*self.inner.input,
+                reg,
                 &*self.inner.bitstream,
                 self.frame_idx,
                 timestamp_us,
-                NVencBufferFormat::IYUV,
+                NVencBufferFormat::ARGB,
                 NVencPicStruct::Frame,
                 pic_ty,
                 None,
@@ -297,9 +254,5 @@ impl VideoEncoder for NvencVideoEncoder {
             is_keyframe: force_idr,
             codec: VideoCodec::H264,
         })
-    }
-
-    fn codec(&self) -> VideoCodec {
-        VideoCodec::H264
     }
 }

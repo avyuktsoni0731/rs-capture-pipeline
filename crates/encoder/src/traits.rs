@@ -1,3 +1,5 @@
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+
 /// Target codec (NVENC/AMF wire later; OpenH264 returns [`VideoCodec::H264`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoCodec {
@@ -43,4 +45,17 @@ pub trait VideoEncoder: Send {
     ) -> anyhow::Result<EncodedPacket>;
 
     fn codec(&self) -> VideoCodec;
+
+    /// NVENC path: feed the capture/internal BGRA texture registered with the encoder (OBS-style).
+    fn supports_bgra_gpu_encode(&self) -> bool {
+        false
+    }
+
+    fn encode_bgra_texture(
+        &mut self,
+        _tex: &ID3D11Texture2D,
+        _timestamp_us: u64,
+    ) -> anyhow::Result<EncodedPacket> {
+        anyhow::bail!("GPU BGRA encoding not supported for this encoder")
+    }
 }

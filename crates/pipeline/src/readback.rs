@@ -1,26 +1,89 @@
 use anyhow::Context;
+use windows::Win32::Foundation::S_FALSE;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_QUERY_DESC,
+    D3D11_QUERY_EVENT, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext,
+    ID3D11Query, ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R8G8_UINT, DXGI_FORMAT_R8_UINT, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_R8G8_SNORM, DXGI_FORMAT_R8G8_UINT, DXGI_FORMAT_R8G8_UNORM,
+    DXGI_FORMAT_R8_SNORM, DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
+};
 
-/// Staging readback of an R8 texture → one byte per pixel, tight rows.
+fn bytes_per_pixel(format: DXGI_FORMAT) -> anyhow::Result<u32> {
+    match format {
+        DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_UNORM | DXGI_FORMAT_R8_SNORM => Ok(1),
+        DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8G8_UNORM | DXGI_FORMAT_R8G8_SNORM => Ok(2),
+        _ => anyhow::bail!("unsupported texture format for CPU readback: {format:?}"),
+    }
+}
+
+/// Wait until all GPU commands **before** the paired `End` complete (used after `CopyResource`).
+fn wait_gpu_idle_after_copy(device: &ID3D11Device, context: &ID3D11DeviceContext) -> anyhow::Result<()> {
+    let desc = D3D11_QUERY_DESC {
+        Query: D3D11_QUERY_EVENT,
+        MiscFlags: 0,
+    };
+    let mut query: Option<ID3D11Query> = None;
+    unsafe {
+        device
+            .CreateQuery(&desc, Some(&mut query))
+            .map_err(|e| anyhow::anyhow!("CreateQuery(EVENT): {e}"))?;
+    }
+    let query = query.context("CreateQuery returned null")?;
+    unsafe {
+        context.End(&query);
+        context.Flush();
+    }
+
+    loop {
+        match unsafe { context.GetData(&query, None, 0, 0) } {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let c = e.code();
+                if c == S_FALSE || c == DXGI_ERROR_WAS_STILL_DRAWING {
+                    std::thread::yield_now();
+                } else {
+                    anyhow::bail!("GetData(EVENT) after readback copy: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Staging readback of an R8-family texture → one byte per pixel, tight rows.
 pub fn copy_r8_texture_to_bytes(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     src: &ID3D11Texture2D,
 ) -> anyhow::Result<(u32, u32, Vec<u8>)> {
-    copy_format_texture_to_bytes(device, context, src, DXGI_FORMAT_R8_UINT, 1)
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { src.GetDesc(&mut desc) };
+    anyhow::ensure!(
+        desc.SampleDesc.Count == 1,
+        "readback needs non-MSAA texture (sample count {})",
+        desc.SampleDesc.Count
+    );
+    let bpp = bytes_per_pixel(desc.Format)?;
+    copy_format_texture_to_bytes(device, context, src, desc.Format, bpp)
 }
 
-/// Staging readback of RG8_UINT → two bytes per pixel (interleaved U,V).
+/// Staging readback of RG8-family → two bytes per pixel (interleaved chroma).
 pub fn copy_rg8_uint_texture_to_bytes(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     src: &ID3D11Texture2D,
 ) -> anyhow::Result<(u32, u32, Vec<u8>)> {
-    copy_format_texture_to_bytes(device, context, src, DXGI_FORMAT_R8G8_UINT, 2)
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { src.GetDesc(&mut desc) };
+    anyhow::ensure!(
+        desc.SampleDesc.Count == 1,
+        "readback needs non-MSAA texture (sample count {})",
+        desc.SampleDesc.Count
+    );
+    let bpp = bytes_per_pixel(desc.Format)?;
+    copy_format_texture_to_bytes(device, context, src, desc.Format, bpp)
 }
 
 fn copy_format_texture_to_bytes(
@@ -52,17 +115,18 @@ fn copy_format_texture_to_bytes(
     unsafe {
         device
             .CreateTexture2D(&staging, None, Some(&mut staging_tex))
-            .ok()
-            .context("CreateTexture2D readback staging")?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "CreateTexture2D staging readback {w}x{h} format={format:?}: {e}"
+                )
+            })?;
     }
     let staging_tex = staging_tex.context("staging null")?;
 
     unsafe {
         context.CopyResource(&staging_tex, src);
-        // Ensure the copy reaches the staging texture before CPU Map (same-queue ordering is not
-        // always enough under GPU load / concurrent NVENC on some drivers).
-        context.Flush();
     }
+    wait_gpu_idle_after_copy(device, context)?;
 
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
     unsafe {

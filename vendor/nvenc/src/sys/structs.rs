@@ -121,11 +121,12 @@ pub struct NVencCreateInputBuffer {
     pub rsvd: u32,
     pub input_buffer: *mut c_void,
     pub p_sys_mem_buffer: *mut c_void,
-    pub rsvd1: [u32; 58],
+    /// `uint32_t reserved1[57]` in `NV_ENC_CREATE_INPUT_BUFFER` (Video Codec SDK).
+    pub rsvd1: [u32; 57],
     pub rsvd2: [*mut c_void; 63],
 }
 
-pub const NV_ENC_CREATE_INPUT_BUFFER_VER: u32 = struct_version(2);
+pub const NV_ENC_CREATE_INPUT_BUFFER_VER: u32 = struct_version(1);
 
 #[repr(C)]
 pub struct NVencCreateBitstreamBuffer {
@@ -686,6 +687,9 @@ pub union NVencCodecPicParams {
     pub rsvd: [u32; 256],
 }
 
+/// Matches `NV_ENC_PIC_PARAMS` / `NV_ENC_PIC_PARAMS_VER` from the Video Codec SDK
+/// (`NVENCAPI_STRUCT_VERSION(4) | (1<<31)`): v5+-only trailing fields were removed so the
+/// layout matches what `NvEncEncodePicture` expects when using that version.
 #[repr(C)]
 pub struct NVencPicParams {
     pub version: u32,
@@ -695,34 +699,29 @@ pub struct NVencPicParams {
     pub encode_pic_flags: u32,
     pub frame_idx: u32,
     pub input_time_stamp: u64,
-    input_duration: u64,
+    pub input_duration: u64,
     pub input_buffer: *mut c_void,
     pub output_bitstream: *mut c_void,
-    // TODO: Windows only, needed for async
-    completion_event: *mut c_void,
+    pub completion_event: *mut c_void,
     pub buffer_format: NVencBufferFormat,
     pub picture_struct: NVencPicStruct,
     pub picture_type: NVencPicType,
     pub codec_pic_params: NVencCodecPicParams,
-    me_hint_counts_per_block: [NVencExternalMeHintCountsPerBlockType; 2],
-    me_external_hints: *mut NVencExternalMeHint,
-    rsvd2: [u32; 7],
-    rsvd5: [*mut c_void; 2],
-    qp_delta_map: *mut i8,
-    qp_deltra_map_size: u32,
-    rsvd_bit_fields: u32,
-    me_hint_ref_pic_dist: [u16; 2],
-    rsvd4: u32,
-    alpha_buffer: *mut c_void,
-    me_external_sb_hints: *mut NVencExternalMeSbHint,
-    me_sb_hints_count: u32,
-    state_buffer_idx: u32,
-    output_recon_buffer: *mut c_void,
-    rsvd3: [u32; 284],
-    rsvd6: [*mut c_void; 57],
+    pub me_hint_counts_per_block: [NVencExternalMeHintCountsPerBlockType; 2],
+    pub me_external_hints: *mut NVencExternalMeHint,
+    pub reserved1: [u32; 6],
+    pub reserved2: [*mut c_void; 2],
+    pub qp_delta_map: *mut i8,
+    pub qp_delta_map_size: u32,
+    pub reserved_bit_fields: u32,
+    pub me_hint_ref_pic_dist: [u16; 2],
+    pub reserved3: [u32; 286],
+    pub reserved4: [*mut c_void; 60],
 }
 
-pub const NV_ENC_PIC_PARAMS_VER: u32 = struct_version(7) | (1 << 31);
+// NVIDIA `nvEncodeAPI.h` defines this **with** `(1<<31)` for this API generation — do not drop the
+// async flag here unless you match a newer header that removed it.
+pub const NV_ENC_PIC_PARAMS_VER: u32 = struct_version(4) | (1 << 31);
 
 #[repr(C)]
 pub struct NVencMeOnlyParams {

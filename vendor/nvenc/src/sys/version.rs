@@ -1,6 +1,8 @@
 //! Contains the nvenc version numbers, encoded as they are in C, for the version this crate was built against
 
-pub const NVENC_MAJOR_VERSION: u16 = 13;
+/// Must stay **≤** `NvEncodeAPIGetMaxSupportedVersion()` packed form `(major << 4) | minor`
+/// on target drivers. Values that are too high break struct `version` fields vs the DLL.
+pub const NVENC_MAJOR_VERSION: u16 = 12;
 pub const NVENC_MINOR_VERSION: u8 = 0;
 
 pub const NVENC_API_VERSION: u32 = NVENC_MAJOR_VERSION as u32 | (NVENC_MINOR_VERSION as u32) << 24;
