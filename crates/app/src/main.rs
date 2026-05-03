@@ -201,7 +201,8 @@ fn main() -> anyhow::Result<()> {
     // Drop this many PCM frames (per-channel time slots) from the start so MP4 audio matches frame 0.
     let mut pending_audio_frame_skip: u64 = 0;
     let mut audio_frame_skip_bootstrapped = false;
-    // If NVENC's first encode_picture fails (driver/FFI mismatch), swap to OpenH264 once.
+    // If NVENC fails with a device/API mismatch, swap to OpenH264 once (do not match generic
+    // `encode_picture` errors — e.g. NeedMoreInput was wrongly swapping to CPU encode).
     let mut nvenc_swapped_to_openh264 = false;
 
     info!(
@@ -367,9 +368,10 @@ fn main() -> anyhow::Result<()> {
                             if allow_nvenc_runtime_fallback
                                 && !nvenc_swapped_to_openh264
                                 && (msg.contains("InvalidDevice")
-                                    || msg.contains("encode_picture")
                                     || msg.contains("Device passed to the API")
-                                    || msg.contains("register_resource"))
+                                    || msg.contains("InvalidEncoderDevice")
+                                    || msg.contains("register_resource")
+                                    || msg.contains("ResourceRegisterFailed"))
                             {
                                 warn!(
                                     "NVENC GPU encode failed ({msg}); switching to OpenH264 for the rest of this run. \

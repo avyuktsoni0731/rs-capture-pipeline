@@ -152,6 +152,11 @@ impl NvencVideoEncoder {
         preset_config.preset_cfg.frame_interval_p = 1;
         preset_config.preset_cfg.rc_params.rate_control_mode = NVencParamsRcMode::VBR;
         preset_config.preset_cfg.rc_params.average_bit_rate = config.bitrate_bps;
+        // One input frame must produce one bitstream for our synchronous capture API. HighQuality
+        // presets can enable lookahead, which makes the first `encode_picture` return
+        // `NeedMoreInput` with no output until more frames are fed — that broke the app and
+        // triggered an OpenH264 fallback (catastrophic for 1080p60).
+        preset_config.preset_cfg.rc_params.look_ahead_depth = 0;
 
         let tuning_label = match tuning {
             NVencTuningInfo::HighQuality => "HighQuality",
@@ -267,7 +272,8 @@ impl VideoEncoder for NvencVideoEncoder {
             NVencPicType::P
         };
 
-        self.inner
+        let enc = self
+            .inner
             .encoder
             .encode_picture(
                 reg,
@@ -278,13 +284,22 @@ impl VideoEncoder for NvencVideoEncoder {
                 NVencPicStruct::Frame,
                 pic_ty,
                 None,
-            )
-            .map_err(|e| anyhow::anyhow!("encode_picture: {e:?}"))?;
+            );
+        match enc {
+            Ok(()) | Err(NVencError::NeedMoreInput) => {}
+            Err(e) => anyhow::bail!("encode_picture: {e:?}"),
+        }
 
         self.frame_idx += 1;
 
         let guard = self.lock_bitstream_wait()?;
-        let data = guard.as_slice().to_vec();
+        let data = guard.as_slice();
+        if data.is_empty() {
+            anyhow::bail!(
+                "NVENC bitstream empty after encode (lookahead/reorder?); try RS_CAPTURE_NVENC_TUNING=low_latency"
+            );
+        }
+        let data = data.to_vec();
         drop(guard);
 
         Ok(EncodedPacket {
