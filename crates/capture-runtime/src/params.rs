@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use crossbeam_channel::Sender;
 
 use crate::config::{AudioCodecChoice, OutputTarget, SessionConfig, VideoCodecPreference};
+
+#[cfg(windows)]
+use encoder::WindowsEncoderPreference;
 use crate::events::{AudioChunk, VideoPacket};
 
 /// Where muxed artifacts go: disk, bounded channels (MyCord / preview), or both.
@@ -72,8 +75,8 @@ pub struct PipelineParams {
     pub async_nvenc: bool,
     pub cfr_mux: bool,
     pub av_drift_threshold_pcm_frames: u64,
-    /// When true, behave like `RS_CAPTURE_ENCODER=openh264` (skip NVENC selection).
-    pub force_software_encoder_only: bool,
+    /// Encoder selection (NVENC vs OpenH264); maps to `encoder::WindowsEncoderPreference` at runtime.
+    pub video_codec_preference: VideoCodecPreference,
     pub remux_with_ffmpeg: bool,
 }
 
@@ -88,7 +91,8 @@ pub struct RunStats {
 impl PipelineParams {
     /// Build runner params from a [`SessionConfig`] (e.g. serialized host settings).
     ///
-    /// - [`VideoCodecPreference::PreferSoftware`] sets [`PipelineParams::force_software_encoder_only`].
+    /// - [`VideoCodecPreference::PreferSoftware`] skips NVENC (OpenH264 only).
+    /// - `RS_CAPTURE_ENCODER=openh264` / `RS_CAPTURE_NVENC=0` still force software even if the session requests GPU (matches legacy `create_best_encoder` env behavior).
     /// - [`AudioCodecChoice::AacLcMf`] is required today; other audio modes return an error until implemented.
     pub fn try_from_session_config(
         session: SessionConfig,
@@ -121,8 +125,17 @@ impl PipelineParams {
             },
         };
 
-        let force_software_encoder_only =
-            matches!(session.video_preference, VideoCodecPreference::PreferSoftware);
+        let env_forces_software = std::env::var("RS_CAPTURE_ENCODER")
+            .map(|s| s.eq_ignore_ascii_case("openh264"))
+            .unwrap_or(false)
+            || std::env::var("RS_CAPTURE_NVENC")
+                .map(|s| s == "0" || s.eq_ignore_ascii_case("off"))
+                .unwrap_or(false);
+        let video_codec_preference = if env_forces_software {
+            VideoCodecPreference::PreferSoftware
+        } else {
+            session.video_preference
+        };
 
         Ok(Self {
             outputs,
@@ -134,9 +147,19 @@ impl PipelineParams {
             async_nvenc: session.async_nvenc,
             cfr_mux: session.cfr_mux,
             av_drift_threshold_pcm_frames: session.av_drift_threshold_pcm_frames,
-            force_software_encoder_only,
+            video_codec_preference,
             remux_with_ffmpeg,
         })
+    }
+
+    /// Maps session/CLI preference into the encoder crate (Windows runner).
+    #[cfg(windows)]
+    pub fn windows_encoder_preference(&self) -> WindowsEncoderPreference {
+        match self.video_codec_preference {
+            VideoCodecPreference::Auto => WindowsEncoderPreference::Auto,
+            VideoCodecPreference::PreferNvenc => WindowsEncoderPreference::PreferNvenc,
+            VideoCodecPreference::PreferSoftware => WindowsEncoderPreference::SoftwareOnly,
+        }
     }
 }
 
@@ -159,14 +182,17 @@ mod tests {
         assert!(p.outputs.directory().is_some());
         assert_eq!(p.fps, 60);
         assert_eq!(p.frame_limit, 100);
-        assert!(!p.force_software_encoder_only);
+        assert_eq!(p.video_codec_preference, crate::config::VideoCodecPreference::Auto);
     }
 
     #[test]
-    fn prefer_software_sets_flag() {
+    fn prefer_software_maps_to_prefer_software() {
         let mut s = SessionConfig::files_only("x");
         s.video_preference = crate::config::VideoCodecPreference::PreferSoftware;
         let p = PipelineParams::try_from_session_config(s, false).expect("ok");
-        assert!(p.force_software_encoder_only);
+        assert_eq!(
+            p.video_codec_preference,
+            crate::config::VideoCodecPreference::PreferSoftware
+        );
     }
 }

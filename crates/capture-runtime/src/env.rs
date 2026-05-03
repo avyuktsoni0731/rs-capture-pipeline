@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
+use crate::config::VideoCodecPreference;
 use crate::params::{PipelineParams, RecordingOutputs};
 
 /// Build [`PipelineParams`] from CLI arguments plus `RS_CAPTURE_*` env overrides (file output only).
@@ -32,9 +33,7 @@ fn build_pipeline_params(
     let async_nvenc = async_nvenc_encode_from_env();
     let cfr_mux = cfr_mux_from_env();
     let av_drift_threshold_pcm_frames = av_drift_threshold_frames_from_env();
-    let force_software_encoder_only = std::env::var("RS_CAPTURE_ENCODER")
-        .map(|s| s.eq_ignore_ascii_case("openh264"))
-        .unwrap_or(false);
+    let video_codec_preference = video_codec_preference_from_env();
     let remux_with_ffmpeg = std::env::var("RS_CAPTURE_FFMPEG_MUX").ok().as_deref() == Some("1");
 
     PipelineParams {
@@ -47,7 +46,7 @@ fn build_pipeline_params(
         async_nvenc,
         cfr_mux,
         av_drift_threshold_pcm_frames,
-        force_software_encoder_only,
+        video_codec_preference,
         remux_with_ffmpeg,
     }
 }
@@ -137,6 +136,20 @@ pub fn log_pipeline_startup(p: &PipelineParams) {
             "A/V drift watchdog: trim/pad when drift exceeds threshold (~{} + one AAC frame margin); may affect sound quality",
             p.av_drift_threshold_pcm_frames
         );
+    }
+}
+
+fn video_codec_preference_from_env() -> VideoCodecPreference {
+    let force_sw = std::env::var("RS_CAPTURE_ENCODER")
+        .map(|s| s.eq_ignore_ascii_case("openh264"))
+        .unwrap_or(false);
+    let skip_nvenc = std::env::var("RS_CAPTURE_NVENC")
+        .map(|s| s == "0" || s.eq_ignore_ascii_case("off"))
+        .unwrap_or(false);
+    if force_sw || skip_nvenc {
+        VideoCodecPreference::PreferSoftware
+    } else {
+        VideoCodecPreference::Auto
     }
 }
 

@@ -8,7 +8,7 @@ pub mod registry;
 mod traits;
 
 pub use i420::nv12_readback_to_i420;
-pub use registry::create_windows_encoder;
+pub use registry::{create_windows_encoder, WindowsEncoderPreference};
 pub use openh264_enc::OpenH264VideoEncoder;
 pub use traits::{EncodedPacket, EncoderConfig, VideoCodec, VideoEncoder};
 
@@ -16,8 +16,12 @@ use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
 /// Prefer NVENC when `device` is provided and the driver stack is available; fall back to OpenH264.
 ///
+/// Uses [`WindowsEncoderPreference::from_env`] (same rules as before):
 /// - `RS_CAPTURE_ENCODER=openh264` — force software encoding only.
 /// - `RS_CAPTURE_NVENC=0` — skip NVENC (same effect as OpenH264-only for the video path).
+///
+/// Embeddable hosts should call [`create_windows_encoder`] with an explicit [`WindowsEncoderPreference`]
+/// so settings do not depend on process environment.
 ///
 /// When NVENC is used, the app registers the internal BGRA D3D texture (OBS-style) instead of
 /// host I420. Encoder defaults aim at OBS-like recording: **HighQuality** tuning, preset **P7→P2**
@@ -28,41 +32,44 @@ pub fn create_best_encoder(
     device: Option<&ID3D11Device>,
     config: &EncoderConfig,
 ) -> anyhow::Result<Box<dyn VideoEncoder>> {
-    let force_sw = std::env::var("RS_CAPTURE_ENCODER")
-        .map(|s| s.eq_ignore_ascii_case("openh264"))
-        .unwrap_or(false);
-    let skip_nvenc = std::env::var("RS_CAPTURE_NVENC")
-        .map(|s| s == "0" || s.eq_ignore_ascii_case("off"))
-        .unwrap_or(false);
+    create_encoder_with_preference(device, config, registry::WindowsEncoderPreference::from_env())
+}
 
-    if !force_sw && !skip_nvenc {
-        if let Some(dev) = device {
-            match nvenc::NvencVideoEncoder::try_new(dev, config) {
-                Ok(enc) => {
-                    tracing::info!(
-                        "Using NVENC H.264 at {}x{} @ {} fps, {} bps (VBR; preset/tuning logged by NVENC init)",
-                        config.width,
-                        config.height,
-                        config.fps,
-                        config.bitrate_bps
-                    );
-                    return Ok(Box::new(enc));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "NVENC init failed; falling back to OpenH264"
-                    );
-                }
+pub fn create_encoder_with_preference(
+    device: Option<&ID3D11Device>,
+    config: &EncoderConfig,
+    preference: registry::WindowsEncoderPreference,
+) -> anyhow::Result<Box<dyn VideoEncoder>> {
+    use registry::WindowsEncoderPreference::*;
+
+    if matches!(preference, SoftwareOnly) {
+        tracing::info!("Windows encoder: OpenH264 only (software-only preference)");
+        return openh264_encoder_from_config(config);
+    }
+
+    if let Some(dev) = device {
+        match nvenc::NvencVideoEncoder::try_new(dev, config) {
+            Ok(enc) => {
+                tracing::info!(
+                    "Using NVENC H.264 at {}x{} @ {} fps, {} bps (VBR; preset/tuning logged by NVENC init)",
+                    config.width,
+                    config.height,
+                    config.fps,
+                    config.bitrate_bps
+                );
+                return Ok(Box::new(enc));
+            }
+            Err(e) => {
+                let prefer = matches!(preference, PreferNvenc);
+                tracing::warn!(
+                    error = %e,
+                    prefer_nvenc = prefer,
+                    "NVENC init failed; falling back to OpenH264"
+                );
             }
         }
-    } else {
-        if force_sw {
-            tracing::info!("RS_CAPTURE_ENCODER=openh264: using OpenH264");
-        }
-        if skip_nvenc {
-            tracing::info!("RS_CAPTURE_NVENC=0: skipping NVENC, using OpenH264");
-        }
+    } else if matches!(preference, PreferNvenc) {
+        tracing::warn!("PreferNvenc but no D3D11 device; using OpenH264");
     }
 
     openh264_encoder_from_config(config)

@@ -155,7 +155,11 @@ pub(crate) fn run_file_recording(
                         params.fps,
                         params.video_bitrate_bps,
                     );
-                    video_enc = Some(encoder::create_windows_encoder(Some(&device), &enc_cfg_boot)?);
+                    video_enc = Some(encoder::create_windows_encoder(
+                        Some(&device),
+                        &enc_cfg_boot,
+                        params.windows_encoder_preference(),
+                    )?);
 
                     if video_enc
                         .as_ref()
@@ -339,7 +343,8 @@ pub(crate) fn run_file_recording(
                     .as_micros()
                     .min(u128::from(u64::MAX)) as u64;
 
-                let allow_nvenc_runtime_fallback = !params.force_software_encoder_only;
+                let allow_nvenc_runtime_fallback =
+                    !matches!(params.video_codec_preference, crate::config::VideoCodecPreference::PreferSoftware);
 
                 let sync_nvenc = video_enc
                     .as_ref()
