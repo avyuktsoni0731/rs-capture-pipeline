@@ -1,5 +1,7 @@
 //! WGC capture + OpenH264 + WASAPI: H.264 + AAC in `clip.mp4` (Media Foundation), WAV debug, optional ffmpeg remux.
 
+mod encode_async;
+
 use std::io::Write;
 use std::process::Command;
 use std::sync::{
@@ -74,6 +76,17 @@ fn video_bitrate_bps() -> u32 {
 /// Disable max throughput / stress tests: `RS_CAPTURE_FRAME_PACING=0`.
 fn frame_pacing_from_env() -> bool {
     match std::env::var("RS_CAPTURE_FRAME_PACING") {
+        Ok(s) if s == "0" || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("false") => {
+            false
+        }
+        Ok(_) => true,
+        Err(_) => true,
+    }
+}
+
+/// Run NVENC on a dedicated thread with a bounded queue (`RS_CAPTURE_ASYNC_ENCODE=0` for legacy sync).
+fn async_nvenc_encode_from_env() -> bool {
+    match std::env::var("RS_CAPTURE_ASYNC_ENCODE") {
         Ok(s) if s == "0" || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("false") => {
             false
         }
@@ -162,6 +175,7 @@ fn main() -> anyhow::Result<()> {
     let fps = capture_fps_from_env();
     let bitrate_bps = video_bitrate_bps();
     let frame_pacing = frame_pacing_from_env();
+    let async_nvenc_wanted = async_nvenc_encode_from_env();
     if fps != 30 {
         info!("RS_CAPTURE_FPS={fps}: encoder and MP4 use this nominal rate (default 30)");
     }
@@ -206,6 +220,7 @@ fn main() -> anyhow::Result<()> {
     let mut last_frame_wall: Option<Instant> = None;
 
     let mut pool_and_size: Option<(TexturePool, FrameSize)> = None;
+    let mut nvenc_async: Option<encode_async::NvencAsync> = None;
     let mut video_enc: Option<Box<dyn VideoEncoder>> = None;
     let mut h264_out: Option<std::fs::File> = None;
     let mut mp4_out: Option<output::Mp4H264File> = None;
@@ -248,6 +263,36 @@ fn main() -> anyhow::Result<()> {
                         encoder::EncoderConfig::new(size.width, size.height, fps, bitrate_bps);
                     video_enc = Some(encoder::create_best_encoder(Some(&device), &enc_cfg_boot)?);
 
+                    if video_enc
+                        .as_ref()
+                        .unwrap()
+                        .supports_bgra_gpu_encode()
+                        && async_nvenc_wanted
+                    {
+                        let enc = video_enc.take().unwrap();
+                        nvenc_async = Some(
+                            encode_async::NvencAsync::new(
+                                &device,
+                                size.width,
+                                size.height,
+                                enc,
+                                4,
+                            )
+                            .context("NVENC async worker")?,
+                        );
+                        info!(
+                            "NVENC async encode worker (bounded queue=4); RS_CAPTURE_ASYNC_ENCODE=0 for sync capture + OpenH264 fallback"
+                        );
+                    } else if video_enc
+                        .as_ref()
+                        .is_some_and(|e| e.supports_bgra_gpu_encode())
+                        && !async_nvenc_wanted
+                    {
+                        info!(
+                            "RS_CAPTURE_ASYNC_ENCODE=0: NVENC runs on capture thread (runtime OpenH264 fallback enabled)"
+                        );
+                    }
+
                     let path = format!("{out_dir}/clip.h264");
                     h264_out = Some(
                         std::fs::File::create(&path)
@@ -273,13 +318,13 @@ fn main() -> anyhow::Result<()> {
                 let enc_cfg =
                     encoder::EncoderConfig::new(size.width, size.height, fps, bitrate_bps);
 
-                let use_gpu_nvenc = video_enc
-                    .as_ref()
-                    .expect("encoder initialized with pool")
-                    .supports_bgra_gpu_encode();
+                let gpu_bgra = nvenc_async.is_some()
+                    || video_enc
+                        .as_ref()
+                        .is_some_and(|e| e.supports_bgra_gpu_encode());
 
                 let mut targets_opt = None;
-                if use_gpu_nvenc {
+                if gpu_bgra {
                     converter
                         .convert(&context, &device, &tex, None)
                         .context("BgraToNv12Converter::convert")?;
@@ -295,8 +340,10 @@ fn main() -> anyhow::Result<()> {
                         .context("BgraToNv12Converter::convert")?;
                     targets_opt = Some(targets);
                 }
-                unsafe {
-                    context.Flush();
+                if nvenc_async.is_none() {
+                    unsafe {
+                        context.Flush();
+                    }
                 }
 
                 let wall_now = Instant::now();
@@ -371,7 +418,30 @@ fn main() -> anyhow::Result<()> {
                     .map(|s| !s.eq_ignore_ascii_case("openh264"))
                     .unwrap_or(true);
 
-                let pkt = if use_gpu_nvenc {
+                let sync_nvenc = video_enc
+                    .as_ref()
+                    .is_some_and(|e| e.supports_bgra_gpu_encode());
+
+                let pkt = if let Some(na) = nvenc_async.as_mut() {
+                    let bgra = converter
+                        .bgra_copy_texture()
+                        .context("internal BGRA copy for NVENC async")?;
+                    let slot = na.slot_next;
+                    encode_async::copy_bgra_to_ping(
+                        &context,
+                        bgra,
+                        &na.pings[slot as usize],
+                    )?;
+                    na.job_tx
+                        .send(encode_async::VideoEncodeJob { slot, ts_us })
+                        .context("NVENC async job channel closed")?;
+                    na.slot_next ^= 1;
+                    let pkt_enc = na
+                        .pkt_rx
+                        .recv()
+                        .context("NVENC async output channel closed")?;
+                    pkt_enc.context("nvenc async encode")?
+                } else if sync_nvenc {
                     let bgra = converter
                         .bgra_copy_texture()
                         .context("internal BGRA copy texture for NVENC")?;
@@ -552,6 +622,10 @@ fn main() -> anyhow::Result<()> {
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
+    }
+
+    if let Some(a) = nvenc_async.take() {
+        a.shutdown().context("NVENC async worker shutdown")?;
     }
 
     stop.store(true, Ordering::SeqCst);

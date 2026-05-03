@@ -1,6 +1,7 @@
 //! Optional **async NVENC** path: capture copies BGRA into ping-pong textures; a worker thread runs
-//! `encode_bgra_texture` so the next WGC frame can be pulled while NVENC finishes.
+//! `encode_bgra_texture` so the next WGC pull can proceed while NVENC finishes.
 
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use anyhow::Context;
@@ -10,9 +11,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
     ID3D11DeviceContext, ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_CPU_ACCESS_NONE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
-};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
 /// One frame for the encode worker (`slot` is 0 or 1 into the ping textures).
 pub struct VideoEncodeJob {
@@ -20,9 +19,54 @@ pub struct VideoEncodeJob {
     pub ts_us: u64,
 }
 
+pub struct NvencAsync {
+    pub job_tx: Sender<VideoEncodeJob>,
+    pub pkt_rx: Receiver<anyhow::Result<EncodedPacket>>,
+    join: JoinHandle<()>,
+    pub pings: Arc<[ID3D11Texture2D; 2]>,
+    pub slot_next: u8,
+}
+
+impl NvencAsync {
+    pub fn new(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        encoder: Box<dyn VideoEncoder>,
+        queue_depth: usize,
+    ) -> anyhow::Result<Self> {
+        let arr = create_nvenc_ping_textures(device, width, height)?;
+        let pings = Arc::new(arr);
+        let pw = Arc::clone(&pings);
+        let (job_tx, job_rx) = bounded::<VideoEncodeJob>(queue_depth);
+        let (pkt_tx, pkt_rx) = bounded::<anyhow::Result<EncodedPacket>>(queue_depth);
+
+        let join = std::thread::Builder::new()
+            .name("nvenc-encode".to_string())
+            .spawn(move || encode_worker_loop(encoder, pw, job_rx, pkt_tx))
+            .context("spawn nvenc-encode")?;
+
+        Ok(Self {
+            job_tx,
+            pkt_rx,
+            join,
+            pings,
+            slot_next: 0,
+        })
+    }
+
+    pub fn shutdown(self) -> anyhow::Result<()> {
+        drop(self.job_tx);
+        self.join
+            .join()
+            .map_err(|_| anyhow::anyhow!("nvenc encode worker panicked"))?;
+        Ok(())
+    }
+}
+
 fn encode_worker_loop(
     mut encoder: Box<dyn VideoEncoder>,
-    pings: [ID3D11Texture2D; 2],
+    pings: Arc<[ID3D11Texture2D; 2]>,
     job_rx: Receiver<VideoEncodeJob>,
     pkt_tx: Sender<anyhow::Result<EncodedPacket>>,
 ) {
@@ -35,8 +79,7 @@ fn encode_worker_loop(
     }
 }
 
-/// Ping-pong BGRA textures (same layout as the converter internal copy).
-pub fn create_nvenc_ping_textures(
+fn create_nvenc_ping_textures(
     device: &ID3D11Device,
     w: u32,
     h: u32,
@@ -53,7 +96,7 @@ pub fn create_nvenc_ping_textures(
         },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-        CPUAccessFlags: DXGI_CPU_ACCESS_NONE.0 as u32,
+        CPUAccessFlags: 0,
         MiscFlags: 0,
     };
     let mut a = None;
@@ -69,26 +112,6 @@ pub fn create_nvenc_ping_textures(
             .context("CreateTexture2D NVENC ping B")?;
     }
     Ok([a.context("ping A null")?, b.context("ping B null")?])
-}
-
-pub fn spawn_nvenc_worker(
-    encoder: Box<dyn VideoEncoder>,
-    pings: [ID3D11Texture2D; 2],
-    job_cap: usize,
-) -> anyhow::Result<(
-    Sender<VideoEncodeJob>,
-    Receiver<anyhow::Result<EncodedPacket>>,
-    JoinHandle<()>,
-)> {
-    let (job_tx, job_rx) = bounded::<VideoEncodeJob>(job_cap);
-    let (pkt_tx, pkt_rx) = bounded::<anyhow::Result<EncodedPacket>>(job_cap);
-
-    let join = std::thread::Builder::new()
-        .name("nvenc-encode".to_string())
-        .spawn(move || encode_worker_loop(encoder, pings, job_rx, pkt_tx))
-        .context("spawn nvenc-encode")?;
-
-    Ok((job_tx, pkt_rx, join))
 }
 
 pub fn copy_bgra_to_ping(
