@@ -11,6 +11,7 @@ use nvenc::sys::enums::{
 };
 use nvenc::sys::guids::{
     NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P2_GUID, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P4_GUID,
+    NV_ENC_PRESET_P5_GUID, NV_ENC_PRESET_P6_GUID, NV_ENC_PRESET_P7_GUID,
 };
 use nvenc::sys::result::NVencError;
 use nvenc::sys::structs::Guid;
@@ -28,21 +29,46 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
     a
 }
 
-fn pick_h264_preset(codecs: &[Guid], presets: &[Guid]) -> anyhow::Result<Guid> {
+/// Prefer slow / high-quality presets first (OBS commonly uses **P5** “slow / good quality”).
+fn pick_h264_preset(codecs: &[Guid], presets: &[Guid]) -> anyhow::Result<(Guid, &'static str)> {
     anyhow::ensure!(
         codecs.iter().any(|g| *g == NV_ENC_CODEC_H264_GUID),
         "NVENC session does not advertise H.264"
     );
-    for candidate in [
-        NV_ENC_PRESET_P4_GUID,
-        NV_ENC_PRESET_P3_GUID,
-        NV_ENC_PRESET_P2_GUID,
+    for (candidate, label) in [
+        (NV_ENC_PRESET_P7_GUID, "P7"),
+        (NV_ENC_PRESET_P6_GUID, "P6"),
+        (NV_ENC_PRESET_P5_GUID, "P5"),
+        (NV_ENC_PRESET_P4_GUID, "P4"),
+        (NV_ENC_PRESET_P3_GUID, "P3"),
+        (NV_ENC_PRESET_P2_GUID, "P2"),
     ] {
         if presets.iter().any(|g| *g == candidate) {
-            return Ok(candidate);
+            return Ok((candidate, label));
         }
     }
-    anyhow::bail!("no supported NVENC H.264 preset (P2–P4)")
+    anyhow::bail!("no supported NVENC H.264 preset (P2–P7)")
+}
+
+fn tuning_info_from_env() -> NVencTuningInfo {
+    match std::env::var("RS_CAPTURE_NVENC_TUNING") {
+        Ok(s) => {
+            let x = s.to_ascii_lowercase();
+            match x.as_str() {
+                "low_latency" | "lowlatency" => NVencTuningInfo::LowLatency,
+                "ultra_low_latency" => NVencTuningInfo::UltraLowLatency,
+                "ultra_high_quality" | "uhq" => NVencTuningInfo::UltraHighQuality,
+                "high_quality" | "hq" | "" => NVencTuningInfo::HighQuality,
+                other => {
+                    tracing::warn!(
+                        "RS_CAPTURE_NVENC_TUNING={other:?} unknown; use high_quality|low_latency|ultra_high_quality — using HighQuality"
+                    );
+                    NVencTuningInfo::HighQuality
+                }
+            }
+        }
+        Err(_) => NVencTuningInfo::HighQuality,
+    }
 }
 
 /// `ManuallyDrop` + custom [`Drop`] so we EOS-flush with a valid bitstream, then unregister DX
@@ -106,13 +132,15 @@ impl NvencVideoEncoder {
         let preset_list = session
             .get_encode_presets(NV_ENC_CODEC_H264_GUID)
             .map_err(|e| anyhow::anyhow!("get_encode_presets: {e:?}"))?;
-        let preset_guid = pick_h264_preset(&codecs, &preset_list)?;
+        let (preset_guid, preset_label) = pick_h264_preset(&codecs, &preset_list)?;
+
+        let tuning = tuning_info_from_env();
 
         let (session, mut preset_config) = session
             .get_encode_preset_config_ex(
                 NV_ENC_CODEC_H264_GUID,
                 preset_guid.clone(),
-                NVencTuningInfo::LowLatency,
+                tuning,
             )
             .map_err(|e| anyhow::anyhow!("get_encode_preset_config_ex: {e:?}"))?;
 
@@ -125,6 +153,19 @@ impl NvencVideoEncoder {
         preset_config.preset_cfg.rc_params.rate_control_mode = NVencParamsRcMode::VBR;
         preset_config.preset_cfg.rc_params.average_bit_rate = config.bitrate_bps;
 
+        let tuning_label = match tuning {
+            NVencTuningInfo::HighQuality => "HighQuality",
+            NVencTuningInfo::LowLatency => "LowLatency",
+            NVencTuningInfo::UltraLowLatency => "UltraLowLatency",
+            NVencTuningInfo::UltraHighQuality => "UltraHighQuality",
+            _ => "other",
+        };
+        tracing::info!(
+            "NVENC encode: preset {} (best of P7→P2 on this GPU), tuning {tuning_label} (RS_CAPTURE_NVENC_TUNING), {} bps VBR",
+            preset_label,
+            config.bitrate_bps
+        );
+
         // Match `vendor/nvenc/examples/simple_encode.rs` (DX11 texture → register → encode).
         let init = InitParams {
             encode_guid: NV_ENC_CODEC_H264_GUID,
@@ -132,7 +173,7 @@ impl NvencVideoEncoder {
             resolution: [width, height],
             aspect_ratio: dar,
             frame_rate: [config.fps.max(1), 1],
-            tuning_info: NVencTuningInfo::LowLatency,
+            tuning_info: tuning,
             buffer_format: NVencBufferFormat::ARGB,
             encode_config: &mut preset_config.preset_cfg,
             enable_ptd: true,

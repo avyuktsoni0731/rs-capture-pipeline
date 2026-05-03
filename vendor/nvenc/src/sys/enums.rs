@@ -458,7 +458,7 @@ pub enum NVencBitDepth {
     Depth10 = 10,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub enum NVencTuningInfo {
     Undefined = 0,

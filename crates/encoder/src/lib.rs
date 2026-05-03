@@ -18,8 +18,10 @@ use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 /// - `RS_CAPTURE_NVENC=0` — skip NVENC (same effect as OpenH264-only for the video path).
 ///
 /// When NVENC is used, the app registers the internal BGRA D3D texture (OBS-style) instead of
-/// host I420. If `encode_bgra_texture` / registration fails, the app can swap to OpenH264
-/// automatically (see `capture-pipeline-app` main loop).
+/// host I420. Encoder defaults aim at OBS-like recording: **HighQuality** tuning, preset **P7→P2**
+/// (pick best), bitrate from the app (default ~45 Mbps — see `RS_CAPTURE_VIDEO_BITRATE`).
+/// If `encode_bgra_texture` / registration fails, the app can swap to OpenH264 automatically
+/// (see `capture-pipeline-app` main loop).
 pub fn create_best_encoder(
     device: Option<&ID3D11Device>,
     config: &EncoderConfig,
@@ -36,7 +38,7 @@ pub fn create_best_encoder(
             match nvenc::NvencVideoEncoder::try_new(dev, config) {
                 Ok(enc) => {
                     tracing::info!(
-                        "Using NVENC H.264 at {}x{} @ {} fps, {} bps (VBR, low latency)",
+                        "Using NVENC H.264 at {}x{} @ {} fps, {} bps (VBR; preset/tuning logged by NVENC init)",
                         config.width,
                         config.height,
                         config.fps,

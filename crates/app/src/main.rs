@@ -27,7 +27,48 @@ use windows::Win32::System::Threading::{
     ABOVE_NORMAL_PRIORITY_CLASS, THREAD_PRIORITY_ABOVE_NORMAL,
 };
 
-const FPS: u32 = 30;
+/// Nominal video FPS for encoder config + MP4 sample timing (actual capture rate follows WGC /
+/// display refresh). Override per run: `RS_CAPTURE_FPS=60` (default 30).
+fn capture_fps_from_env() -> u32 {
+    const DEFAULT: u32 = 30;
+    let Ok(s) = std::env::var("RS_CAPTURE_FPS") else {
+        return DEFAULT;
+    };
+    match s.parse::<u32>() {
+        Ok(n) if (1..=240).contains(&n) => n,
+        Ok(n) => {
+            warn!("RS_CAPTURE_FPS={n} is out of range 1–240; using {DEFAULT}");
+            DEFAULT
+        }
+        Err(_) => {
+            warn!("RS_CAPTURE_FPS={s:?} is not a number; using {DEFAULT}");
+            DEFAULT
+        }
+    }
+}
+
+/// Target VBR bitrate for video (NVENC + OpenH264). Default **45 Mbps** (~OBS “high quality”
+/// 1080p class). Lighter files: `RS_CAPTURE_VIDEO_BITRATE=8000000`.
+fn video_bitrate_bps() -> u32 {
+    const DEFAULT: u32 = 45_000_000;
+    let Ok(s) = std::env::var("RS_CAPTURE_VIDEO_BITRATE") else {
+        return DEFAULT;
+    };
+    if s.is_empty() {
+        return DEFAULT;
+    }
+    match s.parse::<u64>() {
+        Ok(n) if (500_000..=200_000_000).contains(&n) => n as u32,
+        Ok(n) => {
+            warn!("RS_CAPTURE_VIDEO_BITRATE={n} out of range 500000–200000000; using {DEFAULT}");
+            DEFAULT
+        }
+        Err(_) => {
+            warn!("RS_CAPTURE_VIDEO_BITRATE={s:?} not an integer; using {DEFAULT}");
+            DEFAULT
+        }
+    }
+}
 
 enum AudioMsg {
     Ready {
@@ -106,6 +147,20 @@ fn main() -> anyhow::Result<()> {
         .nth(3)
         .map(|s| s != "noaudio")
         .unwrap_or(true);
+    let fps = capture_fps_from_env();
+    let bitrate_bps = video_bitrate_bps();
+    if fps != 30 {
+        info!("RS_CAPTURE_FPS={fps}: encoder and MP4 use this nominal rate (default 30)");
+    }
+    info!(
+        "Video bitrate {} bps ({})",
+        bitrate_bps,
+        if std::env::var("RS_CAPTURE_VIDEO_BITRATE").is_ok() {
+            "from RS_CAPTURE_VIDEO_BITRATE"
+        } else {
+            "default ~OBS-class 45 Mbps; set RS_CAPTURE_VIDEO_BITRATE to override"
+        }
+    );
     std::fs::create_dir_all(&out_dir).with_context(|| format!("create_dir_all {out_dir}"))?;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -150,8 +205,8 @@ fn main() -> anyhow::Result<()> {
     let mut nvenc_swapped_to_openh264 = false;
 
     info!(
-        "Capturing at {} FPS, limit={} (0 means unlimited), system-audio={}",
-        FPS, frame_count, audio_enabled
+        "Capturing at {} fps, limit={} (0 = unlimited), system-audio={}",
+        fps, frame_count, audio_enabled
     );
 
     while !stop.load(Ordering::SeqCst) && (frame_count == 0 || saved < frame_count) {
@@ -171,7 +226,7 @@ fn main() -> anyhow::Result<()> {
                     pool_and_size = Some((pool, size));
 
                     let enc_cfg_boot =
-                        encoder::EncoderConfig::new(size.width, size.height, FPS, 8_000_000);
+                        encoder::EncoderConfig::new(size.width, size.height, fps, bitrate_bps);
                     video_enc = Some(encoder::create_best_encoder(Some(&device), &enc_cfg_boot)?);
 
                     let path = format!("{out_dir}/clip.h264");
@@ -185,7 +240,7 @@ fn main() -> anyhow::Result<()> {
                             &mp4_path,
                             size.width as u16,
                             size.height as u16,
-                            FPS,
+                            fps,
                         )
                         .with_context(|| format!("create {mp4_path}"))?,
                     );
@@ -197,7 +252,7 @@ fn main() -> anyhow::Result<()> {
 
                 let (pool, size) = pool_and_size.as_ref().unwrap();
                 let enc_cfg =
-                    encoder::EncoderConfig::new(size.width, size.height, FPS, 8_000_000);
+                    encoder::EncoderConfig::new(size.width, size.height, fps, bitrate_bps);
 
                 let use_gpu_nvenc = video_enc
                     .as_ref()
@@ -383,7 +438,7 @@ fn main() -> anyhow::Result<()> {
 
                 let mp4 = mp4_out.as_mut().unwrap();
                 let v_ts = mp4.video_timescale();
-                let nominal = std::cmp::max(1u32, v_ts / FPS);
+                let nominal = std::cmp::max(1u32, v_ts / fps);
                 let max_dur = nominal.saturating_mul(10);
                 let duration_ts = if saved == 0 {
                     nominal
@@ -453,7 +508,7 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 saved += 1;
-                if saved % 300 == 0 {
+                if saved > 0 && saved % (fps * 10).max(1) == 0 {
                     info!("Recorded {} video frames...", saved);
                 }
             }
