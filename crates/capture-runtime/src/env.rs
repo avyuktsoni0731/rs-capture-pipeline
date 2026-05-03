@@ -169,22 +169,35 @@ fn stream_backpressure_from_env() -> StreamBackpressure {
 }
 
 fn video_codec_preference_from_env() -> VideoCodecPreference {
-    let force_sw = std::env::var("RS_CAPTURE_ENCODER")
+    video_codec_preference_from_tokens(
+        std::env::var("RS_CAPTURE_ENCODER").ok().as_deref(),
+        std::env::var("RS_CAPTURE_NVENC").ok().as_deref(),
+        std::env::var("RS_CAPTURE_NVENC_REQUIRED").ok().as_deref(),
+    )
+}
+
+/// Same token rules as `encoder::WindowsEncoderPreference::from_env_tokens` (aligned `RS_CAPTURE_*` vars).
+fn video_codec_preference_from_tokens(
+    rs_capture_encoder: Option<&str>,
+    rs_capture_nvenc: Option<&str>,
+    rs_capture_nvenc_required: Option<&str>,
+) -> VideoCodecPreference {
+    let force_sw = rs_capture_encoder
         .map(|s| s.eq_ignore_ascii_case("openh264"))
         .unwrap_or(false);
-    let skip_nvenc = std::env::var("RS_CAPTURE_NVENC")
+    let skip_nvenc = rs_capture_nvenc
         .map(|s| s == "0" || s.eq_ignore_ascii_case("off"))
         .unwrap_or(false);
     if force_sw || skip_nvenc {
         return VideoCodecPreference::PreferSoftware;
     }
-    let require_nvenc = std::env::var("RS_CAPTURE_NVENC_REQUIRED")
+    if rs_capture_nvenc_required
         .map(|s| {
             let t = s.trim();
             t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
         })
-        .unwrap_or(false);
-    if require_nvenc {
+        .unwrap_or(false)
+    {
         VideoCodecPreference::RequireNvenc
     } else {
         VideoCodecPreference::Auto
@@ -263,5 +276,35 @@ fn av_drift_threshold_frames_from_env() -> u64 {
         Ok(s) if s.trim().is_empty() => 0,
         Ok(s) => s.parse::<u64>().unwrap_or(0),
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod video_codec_env_tests {
+    use super::video_codec_preference_from_tokens;
+    use crate::config::VideoCodecPreference;
+
+    #[test]
+    fn token_defaults_match_auto() {
+        assert_eq!(
+            video_codec_preference_from_tokens(None, None, None),
+            VideoCodecPreference::Auto
+        );
+    }
+
+    #[test]
+    fn openh264_maps_to_prefer_software() {
+        assert_eq!(
+            video_codec_preference_from_tokens(Some("openh264"), None, None),
+            VideoCodecPreference::PreferSoftware
+        );
+    }
+
+    #[test]
+    fn nvenc_required_maps_to_require_nvenc() {
+        assert_eq!(
+            video_codec_preference_from_tokens(None, None, Some("yes")),
+            VideoCodecPreference::RequireNvenc
+        );
     }
 }
