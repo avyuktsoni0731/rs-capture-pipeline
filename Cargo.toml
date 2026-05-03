@@ -28,6 +28,7 @@ windows = { version = "0.62", features = [
   "Win32_System_WinRT_Direct3D11",
   "Win32_System_Com",
   "Win32_System_Com_StructuredStorage",
+  "Win32_System_Ole",
   "Win32_System_Variant",
   "Win32_System_Threading",
   "Win32_Foundation",
@@ -41,6 +42,7 @@ anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+audiopus = "0.2"
 
 # Patched `nvenc`: EOS flush with a real bitstream pointer + infallible `Drop` (upstream unwraps on destroy).
 [patch.crates-io]

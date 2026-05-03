@@ -18,8 +18,9 @@ use pipeline::{
     copy_r8_texture_to_bytes, copy_rg8_uint_texture_to_bytes, BgraToNv12Converter, FrameSize,
     TexturePool,
 };
-use audio_encoder::MfAacLcEncoder;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use audio_encoder::{MfAacLcEncoder, OpusEncoder};
+use crossbeam_channel::{unbounded, Receiver, Sender, TrySendError};
+use crate::config::{AudioCodecChoice, StreamBackpressure};
 use crate::events::{AudioChunk, VideoPacket};
 use crate::params::{PipelineParams, RunStats};
 use tracing::{debug, info, warn};
@@ -27,6 +28,206 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
 };
+
+enum RunningAudioEncoder {
+    Aac(MfAacLcEncoder),
+    Opus(OpusEncoder),
+}
+
+impl RunningAudioEncoder {
+    fn push_interleaved_f32(&mut self, samples: &[f32]) -> anyhow::Result<Vec<Vec<u8>>> {
+        match self {
+            Self::Aac(e) => e.push_interleaved_f32(samples),
+            Self::Opus(e) => e.push_interleaved_f32(samples),
+        }
+    }
+
+    fn flush(&mut self) -> anyhow::Result<Vec<Vec<u8>>> {
+        match self {
+            Self::Aac(e) => e.flush(),
+            Self::Opus(e) => e.flush(),
+        }
+    }
+}
+
+fn audio_samples_per_access_unit(params: &PipelineParams) -> u64 {
+    match params.audio_codec {
+        AudioCodecChoice::Opus => 960,
+        _ => 1024,
+    }
+}
+
+fn audio_timeline_sample_rate_hz(params: &PipelineParams, wasapi_rate: u32) -> u32 {
+    match params.audio_codec {
+        AudioCodecChoice::Opus => 48_000,
+        _ => wasapi_rate,
+    }
+}
+
+fn audio_drift_frame_quantum(params: &PipelineParams) -> u64 {
+    match params.audio_codec {
+        AudioCodecChoice::Opus => 960,
+        _ => 1024,
+    }
+}
+
+/// Max muxed **per-channel** samples (AAC/Opus timeline) allowed for this video frame.
+///
+/// Uses the **same** encoder timeline as `pkt.timestamp_us` (`ts_us` µs since session start). Audio
+/// must follow that clock — **not** `Instant::now()` at flush (that drifted from muxed H.264 PTS)
+/// and **not** wall-only bootstrap skip (skipping by “elapsed since t0” trims tens–hundreds of ms
+/// of real PCM and makes audio sound late).
+fn audio_wall_budget_muxed_pc(video_ts_us: u64, timeline_rate_hz: u32) -> u64 {
+    (video_ts_us as u128 * timeline_rate_hz as u128 / 1_000_000) as u64
+}
+
+/// One AAC-LC input quantum (1024 **multi-channel** samples interleaved).
+fn pcm_floats_per_aac_frame(mix_channels: u16) -> usize {
+    1024usize.saturating_mul(mix_channels as usize)
+}
+
+/// WASAPI-rate PCM chunk that yields ~one Opus 20 ms packet after internal resample to 48 kHz.
+fn opus_push_chunk_floats(mix_channels: u16, input_sample_rate: u32) -> usize {
+    let c = mix_channels as usize;
+    let frames_in = match input_sample_rate {
+        44_100 => 882usize,
+        _ => 960usize,
+    };
+    frames_in.saturating_mul(c)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_pending_stereo_pcm(
+    pending: &mut Vec<f32>,
+    wall_budget_muxed_pc: u64,
+    params: &PipelineParams,
+    audio_mix_channels: u16,
+    audio_sample_rate: u32,
+    muxed_audio_samples: &mut u64,
+    audio_samples_total: &mut u64,
+    mp4_out: &mut Option<output::Mp4H264File>,
+    audio_wav: &mut Option<audio::WavFileWriter>,
+    audio_enc: &mut Option<RunningAudioEncoder>,
+    stream_bp: StreamBackpressure,
+    stream_audio_tx: Option<&Sender<AudioChunk>>,
+    stream_audio_chunks_sent: &mut u64,
+    stream_audio_chunks_dropped_full: &mut u64,
+) -> anyhow::Result<()> {
+    let Some(enc) = audio_enc.as_mut() else {
+        return Ok(());
+    };
+    let per_au = audio_samples_per_access_unit(params);
+    let rate_ts = audio_timeline_sample_rate_hz(params, audio_sample_rate);
+
+    loop {
+        if muxed_audio_samples.saturating_add(per_au) > wall_budget_muxed_pc {
+            break;
+        }
+
+        let take_n = match params.audio_codec {
+            AudioCodecChoice::Opus => {
+                let target = opus_push_chunk_floats(audio_mix_channels, audio_sample_rate);
+                if pending.is_empty() {
+                    break;
+                }
+                pending.len().min(target)
+            }
+            _ => {
+                let need = pcm_floats_per_aac_frame(audio_mix_channels);
+                if pending.len() < need {
+                    break;
+                }
+                need
+            }
+        };
+
+        let frame: Vec<f32> = pending.drain(..take_n).collect();
+        *audio_samples_total += frame.len() as u64;
+        if let Some(wav) = audio_wav.as_mut() {
+            wav.write_f32_interleaved(&frame)
+                .context("write audio.wav")?;
+        }
+        let aus = enc
+            .push_interleaved_f32(&frame)
+            .context("audio encode")?;
+        for au in aus {
+            let au_start = *muxed_audio_samples;
+            *muxed_audio_samples = muxed_audio_samples.saturating_add(per_au);
+            let ts_audio_us =
+                (au_start as u128 * 1_000_000 / u128::from(rate_ts)) as u64;
+            if let Some(mp4) = mp4_out.as_mut() {
+                if matches!(params.audio_codec, AudioCodecChoice::AacLcMf) {
+                    mp4.write_aac_access_unit(&au, 1024)
+                        .context("write AAC to MP4")?;
+                }
+            }
+            if let Some(atx) = stream_audio_tx {
+                let chunk_a = match params.audio_codec {
+                    AudioCodecChoice::Opus => AudioChunk::OpusPacket {
+                        channels: audio_mix_channels,
+                        timestamp_us: ts_audio_us,
+                        payload: au.clone(),
+                    },
+                    _ => AudioChunk::AacRaw {
+                        sample_rate: audio_sample_rate,
+                        channels: audio_mix_channels,
+                        timestamp_us: ts_audio_us,
+                        payload: au.clone(),
+                    },
+                };
+                match stream_push_audio(atx, chunk_a, stream_bp) {
+                    StreamPushOutcome::Delivered => *stream_audio_chunks_sent += 1,
+                    StreamPushOutcome::DroppedFull => *stream_audio_chunks_dropped_full += 1,
+                    StreamPushOutcome::Disconnected => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamPushOutcome {
+    Delivered,
+    DroppedFull,
+    Disconnected,
+}
+
+fn stream_push_video(
+    tx: &Sender<VideoPacket>,
+    packet: VideoPacket,
+    policy: StreamBackpressure,
+) -> StreamPushOutcome {
+    match policy {
+        StreamBackpressure::Block => match tx.send(packet) {
+            Ok(()) => StreamPushOutcome::Delivered,
+            Err(_) => StreamPushOutcome::Disconnected,
+        },
+        StreamBackpressure::DropWhenFull => match tx.try_send(packet) {
+            Ok(()) => StreamPushOutcome::Delivered,
+            Err(TrySendError::Full(_)) => StreamPushOutcome::DroppedFull,
+            Err(TrySendError::Disconnected(_)) => StreamPushOutcome::Disconnected,
+        },
+    }
+}
+
+fn stream_push_audio(
+    tx: &Sender<AudioChunk>,
+    chunk: AudioChunk,
+    policy: StreamBackpressure,
+) -> StreamPushOutcome {
+    match policy {
+        StreamBackpressure::Block => match tx.send(chunk) {
+            Ok(()) => StreamPushOutcome::Delivered,
+            Err(_) => StreamPushOutcome::Disconnected,
+        },
+        StreamBackpressure::DropWhenFull => match tx.try_send(chunk) {
+            Ok(()) => StreamPushOutcome::Delivered,
+            Err(TrySendError::Full(_)) => StreamPushOutcome::DroppedFull,
+            Err(TrySendError::Disconnected(_)) => StreamPushOutcome::Disconnected,
+        },
+    }
+}
 
 enum AudioMsg {
     Ready {
@@ -36,6 +237,24 @@ enum AudioMsg {
     },
     Chunk(PcmChunk),
     Error(String),
+}
+
+/// Gentle HF tilt so vocals/mids aren’t masked by bass-heavy fold-down; `0` / `off` disables.
+fn presence_emphasis_strength_from_env() -> f32 {
+    match std::env::var("RS_CAPTURE_PRESENCE_EMPHASIS").ok() {
+        None => 0.10,
+        Some(s) => {
+            let t = s.trim();
+            if t.is_empty() || t == "0" || t.eq_ignore_ascii_case("off") {
+                0.0
+            } else {
+                t.parse::<f32>()
+                    .ok()
+                    .filter(|&v| (0.0..=0.35).contains(&v))
+                    .unwrap_or(0.10)
+            }
+        }
+    }
 }
 
 fn audio_loopback_thread(stop: Arc<AtomicBool>, tx: Sender<AudioMsg>) {
@@ -84,6 +303,11 @@ pub(crate) fn run_file_recording(
 
     let mut stream_video_packets_sent: u64 = 0;
     let mut stream_audio_chunks_sent: u64 = 0;
+    let mut stream_video_packets_dropped_full: u64 = 0;
+    let mut stream_audio_chunks_dropped_full: u64 = 0;
+    let stream_bp = params.stream_backpressure;
+    let presence_emphasis = presence_emphasis_strength_from_env();
+    let mut audio_presence_prev = vec![0.0f32; 2];
 
     info!("Creating D3D11 device…");
     let D3d11Context { device, context } = create_d3d11_device()?;
@@ -109,9 +333,12 @@ pub(crate) fn run_file_recording(
     let mut audio_rx: Option<Receiver<AudioMsg>> = None;
     let mut audio_thread: Option<std::thread::JoinHandle<()>> = None;
     let mut audio_sample_rate: u32 = 0;
+    // WASAPI channel count (may be 6/8); trim/silence use this layout.
     let mut audio_pcm_channels: u16 = 2;
+    // Channels written to WAV and fed to AAC/Opus (mono/stereo after optional downmix).
+    let mut audio_mix_channels: u16 = 2;
     let mut audio_wav: Option<audio::WavFileWriter> = None;
-    let mut aac_enc: Option<MfAacLcEncoder> = None;
+    let mut audio_enc: Option<RunningAudioEncoder> = None;
     let mut audio_samples_total: u64 = 0;
     // Drop this many PCM frames (per-channel time slots) from the start so MP4 audio matches frame 0.
     let mut pending_audio_frame_skip: u64 = 0;
@@ -120,6 +347,8 @@ pub(crate) fn run_file_recording(
     let mut muxed_video_duration_ts: u64 = 0;
     // AAC timeline in PCM samples (per channel), i.e. sum of `samples_per_access_unit` muxed.
     let mut muxed_audio_samples: u64 = 0;
+    // Stereo floats after trim/downmix, paced to encoder `ts_us` (same timeline as video packets).
+    let mut pending_stereo_pcm: Vec<f32> = Vec::new();
     // Pad this many all-zero PCM frames at the start of the next chunk(s) to slow audio vs video.
     let mut pending_silence_pcm_frames: u64 = 0;
     // If NVENC fails with a device/API mismatch, swap to OpenH264 once (do not match generic
@@ -280,6 +509,12 @@ pub(crate) fn run_file_recording(
                         }) => {
                             audio_sample_rate = sample_rate;
                             audio_pcm_channels = channels;
+                            audio_mix_channels = if channels > 2 { 2 } else { channels };
+                            if channels > 2 {
+                                info!(
+                                    "WASAPI mix is {channels} channels → stereo downmix for WAV / AAC / Opus"
+                                );
+                            }
                             info!(
                                 "WASAPI format: {} Hz, {} ch, {} bits (dedicated capture thread)",
                                 sample_rate, channels, bits_per_sample
@@ -291,7 +526,11 @@ pub(crate) fn run_file_recording(
                                     wav_path.display()
                                 );
                                 Some(
-                                    audio::WavFileWriter::create(&wav_path, sample_rate, channels)
+                                    audio::WavFileWriter::create(
+                                        &wav_path,
+                                        sample_rate,
+                                        audio_mix_channels,
+                                    )
                                         .with_context(|| {
                                             format!("create {}", wav_path.display())
                                         })?,
@@ -300,25 +539,65 @@ pub(crate) fn run_file_recording(
                                 info!("Stream-only: WAV debug file skipped");
                                 None
                             };
-                            let aac_br = 128_000u32;
-                            match MfAacLcEncoder::new(sample_rate, channels, aac_br) {
-                                Ok(enc) => {
-                                    if let Some(mp4) = mp4_out.as_mut() {
-                                        mp4
-                                            .enable_aac(sample_rate, channels, aac_br)
-                                            .with_context(|| "Mp4H264File::enable_aac")?;
-                                    }
-                                    aac_enc = Some(enc);
-                                    if mp4_out.is_some() {
-                                        info!("In-process AAC (MF AAC-LC) muxed into clip.mp4");
-                                    } else {
-                                        info!("In-process AAC (MF AAC-LC) for stream output");
+                            match params.audio_codec {
+                                AudioCodecChoice::AacLcMf => {
+                                    let aac_br = std::env::var("RS_CAPTURE_AAC_BITRATE")
+                                        .ok()
+                                        .and_then(|s| s.parse::<u32>().ok())
+                                        .unwrap_or(192_000);
+                                    match MfAacLcEncoder::new(sample_rate, audio_mix_channels, aac_br)
+                                    {
+                                        Ok(enc) => {
+                                            if let Some(mp4) = mp4_out.as_mut() {
+                                                mp4
+                                                    .enable_aac(sample_rate, audio_mix_channels, aac_br)
+                                                    .with_context(|| "Mp4H264File::enable_aac")?;
+                                            }
+                                            audio_enc = Some(RunningAudioEncoder::Aac(enc));
+                                            if mp4_out.is_some() {
+                                                info!(
+                                                    bitrate = aac_br,
+                                                    "In-process AAC (MF AAC-LC) muxed into clip.mp4 (RS_CAPTURE_AAC_BITRATE)"
+                                                );
+                                            } else {
+                                                info!(
+                                                    bitrate = aac_br,
+                                                    "In-process AAC (MF AAC-LC) for stream output (RS_CAPTURE_AAC_BITRATE)"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "MF AAC-LC unavailable ({e:#}); clip.mp4 stays video-only, audio remains in audio.wav"
+                                            );
+                                        }
                                     }
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        "MF AAC-LC unavailable ({e:#}); clip.mp4 stays video-only, audio remains in audio.wav"
-                                    );
+                                AudioCodecChoice::Opus => {
+                                    let opus_br = std::env::var("RS_CAPTURE_OPUS_BITRATE")
+                                        .ok()
+                                        .and_then(|s| s.parse::<u32>().ok())
+                                        .unwrap_or(128_000);
+                                    match OpusEncoder::new(sample_rate, audio_mix_channels, opus_br) {
+                                        Ok(enc) => {
+                                            if mp4_out.is_some() {
+                                                warn!(
+                                                    "Opus: clip.mp4 is video-only; audio is Opus packets on stream and PCM in audio.wav"
+                                                );
+                                            }
+                                            info!(
+                                                "Opus encode {} bps (20 ms @ 48 kHz); RS_CAPTURE_OPUS_BITRATE to override",
+                                                opus_br
+                                            );
+                                            audio_enc = Some(RunningAudioEncoder::Opus(enc));
+                                        }
+                                        Err(e) => {
+                                            warn!("Opus encoder init failed ({e:#}); no compressed audio on stream");
+                                        }
+                                    }
+                                }
+                                AudioCodecChoice::PcmOnly => {
+                                    warn!("Session requested PcmOnly — audio compression skipped (not fully wired)");
                                 }
                             }
                             audio_rx = Some(rx);
@@ -343,8 +622,11 @@ pub(crate) fn run_file_recording(
                     .as_micros()
                     .min(u128::from(u64::MAX)) as u64;
 
-                let allow_nvenc_runtime_fallback =
-                    !matches!(params.video_codec_preference, crate::config::VideoCodecPreference::PreferSoftware);
+                let allow_nvenc_runtime_fallback = matches!(
+                    params.video_codec_preference,
+                    crate::config::VideoCodecPreference::Auto
+                        | crate::config::VideoCodecPreference::PreferNvenc
+                );
 
                 let sync_nvenc = video_enc
                     .as_ref()
@@ -491,8 +773,12 @@ pub(crate) fn run_file_recording(
                             timestamp_us: pkt.timestamp_us,
                             is_keyframe: key,
                         };
-                        if vtx.send(vp).is_ok() {
-                            stream_video_packets_sent += 1;
+                        match stream_push_video(vtx, vp, stream_bp) {
+                            StreamPushOutcome::Delivered => stream_video_packets_sent += 1,
+                            StreamPushOutcome::DroppedFull => {
+                                stream_video_packets_dropped_full += 1;
+                            }
+                            StreamPushOutcome::Disconnected => {}
                         }
                     }
                     muxed_video_duration_ts =
@@ -501,7 +787,10 @@ pub(crate) fn run_file_recording(
 
                 if let Some(rx) = audio_rx.as_ref() {
                     if !audio_frame_skip_bootstrapped && audio_sample_rate > 0 {
-                        pending_audio_frame_skip = ts_us_to_pcm_frames(ts_us, audio_sample_rate);
+                        // Same timeline as video encoder PTS for this frame (not wall-clock “since t0”,
+                        // which over-trims startup PCM and makes audio late).
+                        pending_audio_frame_skip =
+                            ts_us_to_pcm_frames(ts_us, audio_sample_rate);
                         audio_frame_skip_bootstrapped = true;
                     }
                     while let Ok(msg) = rx.try_recv() {
@@ -523,45 +812,31 @@ pub(crate) fn run_file_recording(
                                     prepended,
                                     trimmed,
                                 );
+                                if audio_pcm_channels > 2 {
+                                    chunk.samples_f32 = audio::downmix_interleaved_f32_to_stereo(
+                                        &chunk.samples_f32,
+                                        audio_pcm_channels as usize,
+                                    );
+                                }
+                                if presence_emphasis > 0.0 {
+                                    audio::emphasis_interleaved_f32_inplace(
+                                        &mut chunk.samples_f32,
+                                        audio_mix_channels as usize,
+                                        &mut audio_presence_prev,
+                                        presence_emphasis,
+                                    );
+                                }
                                 if chunk.samples_f32.is_empty() {
                                     continue;
                                 }
-                                audio_samples_total += chunk.samples_f32.len() as u64;
-                                if let Some(wav) = audio_wav.as_mut() {
-                                    wav.write_f32_interleaved(&chunk.samples_f32)
-                                        .context("write audio.wav")?;
-                                }
-                                if let Some(enc) = aac_enc.as_mut() {
-                                    let aus = enc
-                                        .push_interleaved_f32(&chunk.samples_f32)
-                                        .context("AAC encode")?;
-                                    for au in aus {
-                                        let au_start = muxed_audio_samples;
-                                        muxed_audio_samples =
-                                            muxed_audio_samples.saturating_add(1024);
-                                        let ts_audio_us = (au_start as u128
-                                            * 1_000_000
-                                            / u128::from(audio_sample_rate))
-                                            as u64;
-                                        if let Some(mp4) = mp4_out.as_mut() {
-                                            mp4
-                                                .write_aac_access_unit(&au, 1024)
-                                                .context("write AAC to MP4")?;
-                                        }
-                                        if let Some((_, atx)) =
-                                            params.outputs.stream_senders()
-                                        {
-                                            let chunk_a = AudioChunk::AacRaw {
-                                                sample_rate: audio_sample_rate,
-                                                channels: audio_pcm_channels,
-                                                timestamp_us: ts_audio_us,
-                                                payload: au.clone(),
-                                            };
-                                            if atx.send(chunk_a).is_ok() {
-                                                stream_audio_chunks_sent += 1;
-                                            }
-                                        }
+                                if audio_enc.is_none() {
+                                    audio_samples_total += chunk.samples_f32.len() as u64;
+                                    if let Some(wav) = audio_wav.as_mut() {
+                                        wav.write_f32_interleaved(&chunk.samples_f32)
+                                            .context("write audio.wav")?;
                                     }
+                                } else {
+                                    pending_stereo_pcm.extend_from_slice(&chunk.samples_f32);
                                 }
                             }
                             AudioMsg::Error(e) => {
@@ -573,20 +848,41 @@ pub(crate) fn run_file_recording(
                             }
                         }
                     }
+                    let timeline_hz =
+                        audio_timeline_sample_rate_hz(&params, audio_sample_rate);
+                    let wall = audio_wall_budget_muxed_pc(ts_us, timeline_hz);
+                    let stream_audio_tx = params.outputs.stream_senders().map(|(_, a)| a);
+                    flush_pending_stereo_pcm(
+                        &mut pending_stereo_pcm,
+                        wall,
+                        &params,
+                        audio_mix_channels,
+                        audio_sample_rate,
+                        &mut muxed_audio_samples,
+                        &mut audio_samples_total,
+                        &mut mp4_out,
+                        &mut audio_wav,
+                        &mut audio_enc,
+                        stream_bp,
+                        stream_audio_tx,
+                        &mut stream_audio_chunks_sent,
+                        &mut stream_audio_chunks_dropped_full,
+                    )?;
                 }
 
                 if params.av_drift_threshold_pcm_frames > 0
                     && audio_sample_rate > 0
-                    && aac_enc.is_some()
+                    && audio_enc.is_some()
                 {
                     reconcile_mux_av_drift(
                         muxed_video_duration_ts,
                         muxed_audio_samples,
                         v_ts,
-                        audio_sample_rate,
+                        audio_timeline_sample_rate_hz(&params, audio_sample_rate),
                         params.av_drift_threshold_pcm_frames,
                         &mut pending_silence_pcm_frames,
                         &mut pending_audio_frame_skip,
+                        audio_drift_frame_quantum(&params),
                     );
                 }
 
@@ -650,60 +946,92 @@ pub(crate) fn run_file_recording(
                         prepended,
                         trimmed,
                     );
+                    if audio_pcm_channels > 2 {
+                        chunk.samples_f32 = audio::downmix_interleaved_f32_to_stereo(
+                            &chunk.samples_f32,
+                            audio_pcm_channels as usize,
+                        );
+                    }
+                    if presence_emphasis > 0.0 {
+                        audio::emphasis_interleaved_f32_inplace(
+                            &mut chunk.samples_f32,
+                            audio_mix_channels as usize,
+                            &mut audio_presence_prev,
+                            presence_emphasis,
+                        );
+                    }
                     if chunk.samples_f32.is_empty() {
                         continue;
                     }
-                    audio_samples_total += chunk.samples_f32.len() as u64;
-                    if let Some(wav) = audio_wav.as_mut() {
-                        wav.write_f32_interleaved(&chunk.samples_f32)
-                            .context("shutdown drain: audio.wav")?;
-                    }
-                    if let Some(enc) = aac_enc.as_mut() {
-                        let aus = enc
-                            .push_interleaved_f32(&chunk.samples_f32)
-                            .context("shutdown drain: AAC encode")?;
-                        for au in aus {
-                            let au_start = muxed_audio_samples;
-                            muxed_audio_samples =
-                                muxed_audio_samples.saturating_add(1024);
-                            let ts_audio_us = (au_start as u128 * 1_000_000
-                                / u128::from(audio_sample_rate))
-                                as u64;
-                            if let Some(mp4) = mp4_out.as_mut() {
-                                mp4
-                                    .write_aac_access_unit(&au, 1024)
-                                    .context("shutdown drain: MP4 AAC")?;
-                            }
-                            if let Some((_, atx)) = params.outputs.stream_senders() {
-                                let chunk_a = AudioChunk::AacRaw {
-                                    sample_rate: audio_sample_rate,
-                                    channels: audio_pcm_channels,
-                                    timestamp_us: ts_audio_us,
-                                    payload: au.clone(),
-                                };
-                                if atx.send(chunk_a).is_ok() {
-                                    stream_audio_chunks_sent += 1;
-                                }
-                            }
+                    if audio_enc.is_none() {
+                        audio_samples_total += chunk.samples_f32.len() as u64;
+                        if let Some(wav) = audio_wav.as_mut() {
+                            wav.write_f32_interleaved(&chunk.samples_f32)
+                                .context("shutdown drain: audio.wav")?;
                         }
+                    } else {
+                        pending_stereo_pcm.extend_from_slice(&chunk.samples_f32);
                     }
                 }
                 AudioMsg::Error(e) => warn!("audio thread (shutdown drain): {e}"),
                 AudioMsg::Ready { .. } => {}
             }
         }
+        let stream_audio_tx = params.outputs.stream_senders().map(|(_, a)| a);
+        flush_pending_stereo_pcm(
+            &mut pending_stereo_pcm,
+            u64::MAX,
+            &params,
+            audio_mix_channels,
+            audio_sample_rate,
+            &mut muxed_audio_samples,
+            &mut audio_samples_total,
+            &mut mp4_out,
+            &mut audio_wav,
+            &mut audio_enc,
+            stream_bp,
+            stream_audio_tx,
+            &mut stream_audio_chunks_sent,
+            &mut stream_audio_chunks_dropped_full,
+        )?;
+        if matches!(params.audio_codec, AudioCodecChoice::AacLcMf) && !pending_stereo_pcm.is_empty()
+        {
+            let need = pcm_floats_per_aac_frame(audio_mix_channels);
+            let r = pending_stereo_pcm.len() % need;
+            if r != 0 {
+                pending_stereo_pcm.resize(pending_stereo_pcm.len() + (need - r), 0.0);
+            }
+            let stream_audio_tx = params.outputs.stream_senders().map(|(_, a)| a);
+            flush_pending_stereo_pcm(
+                &mut pending_stereo_pcm,
+                u64::MAX,
+                &params,
+                audio_mix_channels,
+                audio_sample_rate,
+                &mut muxed_audio_samples,
+                &mut audio_samples_total,
+                &mut mp4_out,
+                &mut audio_wav,
+                &mut audio_enc,
+                stream_bp,
+                stream_audio_tx,
+                &mut stream_audio_chunks_sent,
+                &mut stream_audio_chunks_dropped_full,
+            )?;
+        }
         if params.av_drift_threshold_pcm_frames > 0
             && audio_sample_rate > 0
-            && aac_enc.is_some()
+            && audio_enc.is_some()
         {
             reconcile_mux_av_drift(
                 muxed_video_duration_ts,
                 muxed_audio_samples,
                 v_ts_shutdown,
-                audio_sample_rate,
+                audio_timeline_sample_rate_hz(&params, audio_sample_rate),
                 params.av_drift_threshold_pcm_frames,
                 &mut pending_silence_pcm_frames,
                 &mut pending_audio_frame_skip,
+                audio_drift_frame_quantum(&params),
             );
         }
     }
@@ -711,26 +1039,41 @@ pub(crate) fn run_file_recording(
         let _ = j.join();
     }
 
-    if let Some(enc) = aac_enc.as_mut() {
-        for au in enc.flush().context("AAC flush")? {
+    if let Some(enc) = audio_enc.as_mut() {
+        let per_au = audio_samples_per_access_unit(&params);
+        let rate_ts = audio_timeline_sample_rate_hz(&params, audio_sample_rate);
+        for au in enc.flush().context("audio encoder flush")? {
             let au_start = muxed_audio_samples;
-            muxed_audio_samples = muxed_audio_samples.saturating_add(1024);
+            muxed_audio_samples = muxed_audio_samples.saturating_add(per_au);
             let ts_audio_us =
-                (au_start as u128 * 1_000_000 / u128::from(audio_sample_rate)) as u64;
+                (au_start as u128 * 1_000_000 / u128::from(rate_ts)) as u64;
             if let Some(mp4) = mp4_out.as_mut() {
-                mp4
-                    .write_aac_access_unit(&au, 1024)
-                    .context("write final AAC samples")?;
+                if matches!(params.audio_codec, AudioCodecChoice::AacLcMf) {
+                    mp4
+                        .write_aac_access_unit(&au, 1024)
+                        .context("write final AAC samples")?;
+                }
             }
             if let Some((_, atx)) = params.outputs.stream_senders() {
-                let chunk_a = AudioChunk::AacRaw {
-                    sample_rate: audio_sample_rate,
-                    channels: audio_pcm_channels,
-                    timestamp_us: ts_audio_us,
-                    payload: au.clone(),
+                let chunk_a = match params.audio_codec {
+                    AudioCodecChoice::Opus => AudioChunk::OpusPacket {
+                        channels: audio_mix_channels,
+                        timestamp_us: ts_audio_us,
+                        payload: au.clone(),
+                    },
+                    _ => AudioChunk::AacRaw {
+                        sample_rate: audio_sample_rate,
+                        channels: audio_mix_channels,
+                        timestamp_us: ts_audio_us,
+                        payload: au.clone(),
+                    },
                 };
-                if atx.send(chunk_a).is_ok() {
-                    stream_audio_chunks_sent += 1;
+                match stream_push_audio(atx, chunk_a, stream_bp) {
+                    StreamPushOutcome::Delivered => stream_audio_chunks_sent += 1,
+                    StreamPushOutcome::DroppedFull => {
+                        stream_audio_chunks_dropped_full += 1;
+                    }
+                    StreamPushOutcome::Disconnected => {}
                 }
             }
         }
@@ -767,25 +1110,29 @@ pub(crate) fn run_file_recording(
 
     let done_files = match params.outputs.directory() {
         Some(dir) => format!(
-            "{}clip.h264 + {}clip.mp4",
-            dir.display(),
-            dir.display()
+            "{} + {}",
+            dir.join("clip.h264").display(),
+            dir.join("clip.mp4").display()
         ),
         None => "(no files)".to_string(),
     };
     info!(
-        "Done — {}, frames={}, audio_samples={}, stream_video_packets={}, stream_audio_chunks={}",
+        "Done — {}, frames={}, audio_samples={}, stream_video_packets={}, stream_audio_chunks={}, stream_video_dropped_full={}, stream_audio_dropped_full={}",
         done_files,
         saved,
         audio_samples_total,
         stream_video_packets_sent,
-        stream_audio_chunks_sent
+        stream_audio_chunks_sent,
+        stream_video_packets_dropped_full,
+        stream_audio_chunks_dropped_full
     );
     Ok(RunStats {
         frames_captured: saved,
         audio_samples_total,
         stream_video_packets_sent,
         stream_audio_chunks_sent,
+        stream_video_packets_dropped_full,
+        stream_audio_chunks_dropped_full,
     })
 }
 
@@ -845,8 +1192,8 @@ fn prepend_silence_pcm_frames_front(
 }
 
 /// Linear fade so hard boundaries (silence insert, time-skip trim) do not click or hiss in AAC.
-/// ~1 ms at 48 kHz.
-const PCM_EDGE_FADE_FRAMES: usize = 48;
+/// ~0.5 ms at 48 kHz — shorter preserves transients better after trims.
+const PCM_EDGE_FADE_FRAMES: usize = 24;
 
 fn smooth_pcm_chunk_edges(
     samples: &mut [f32],
@@ -891,7 +1238,7 @@ fn smooth_pcm_chunk_edges(
     }
 }
 
-/// Keeps muxed AAC timeline aligned with muxed video duration (round-trip remainder vs AAC framing).
+/// Keeps muxed audio timeline aligned with muxed video duration (AAC 1024-sample or Opus 960-sample steps).
 const DRIFT_CORRECT_MAX_STEP: u64 = 4800;
 
 fn reconcile_mux_av_drift(
@@ -902,15 +1249,15 @@ fn reconcile_mux_av_drift(
     threshold: u64,
     pending_silence_pcm_frames: &mut u64,
     pending_audio_frame_skip: &mut u64,
+    access_unit_samples: u64,
 ) {
     if threshold == 0 || sample_rate == 0 || v_ts == 0 {
         return;
     }
     let want = (muxed_video_duration_ts as u128 * sample_rate as u128 / v_ts as u128) as u64;
     let delta = want as i128 - muxed_audio_samples as i128;
-    // AAC advances mux in 1024-sample steps; comparing to a smooth `want` curve causes tiny
-    // oscillating pad/trim ("static") unless we require a margin past one LC frame.
-    let margin = threshold.saturating_add(1024) as i128;
+    // Compare to a smooth `want` curve; require margin past one encoded frame to avoid trim/pad oscillation.
+    let margin = threshold.saturating_add(access_unit_samples) as i128;
     if delta > margin {
         let add = (delta as u64).min(DRIFT_CORRECT_MAX_STEP);
         *pending_silence_pcm_frames = pending_silence_pcm_frames.saturating_add(add);

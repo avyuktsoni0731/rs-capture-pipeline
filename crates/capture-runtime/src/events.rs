@@ -1,4 +1,6 @@
 //! Types crossing the process boundary to **consumers** (file muxer, WebSocket, WebRTC bridge).
+//!
+//! Delivery semantics come from [`crate::StreamBackpressure`] on [`crate::PipelineParams`] when using stream outputs.
 
 /// Monotonic clock for correlating video and audio (microseconds from capture start / first frame).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -27,6 +29,12 @@ pub enum AudioChunk {
     /// Raw AAC-LC access unit (no ADTS), 1024 samples per channel per AU at typical rates.
     AacRaw {
         sample_rate: u32,
+        channels: u16,
+        timestamp_us: u64,
+        payload: Vec<u8>,
+    },
+    /// Opus packet (RFC 6716), 48 kHz decode timeline; 20 ms frames (960 samples/channel) from our encoder.
+    OpusPacket {
         channels: u16,
         timestamp_us: u64,
         payload: Vec<u8>,

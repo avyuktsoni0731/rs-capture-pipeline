@@ -6,4 +6,5 @@ edition = "2021"
 [dependencies]
 anyhow.workspace = true
 audio = { path = "../audio" }
+audiopus.workspace = true
 windows.workspace = true

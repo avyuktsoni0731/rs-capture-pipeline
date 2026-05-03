@@ -1,6 +1,11 @@
 //! Audio capture abstractions (WASAPI/mic implementations to be added).
+mod downmix;
+mod presence;
 mod wasapi;
 mod wav;
+
+pub use downmix::downmix_interleaved_f32_to_stereo;
+pub use presence::emphasis_interleaved_f32_inplace;
 
 /// Interleaved PCM audio chunk.
 #[derive(Clone, Debug)]

@@ -31,7 +31,8 @@ pub mod encode_async;
 mod run_win;
 
 pub use config::{
-    stream_pair, AudioCodecChoice, OutputTarget, SessionConfig, VideoCodecPreference,
+    stream_pair, AudioCodecChoice, OutputTarget, SessionConfig, StreamBackpressure,
+    VideoCodecPreference,
 };
 pub use env::{
     log_pipeline_startup, pipeline_params_files_and_stream, pipeline_params_from_cli_and_env,

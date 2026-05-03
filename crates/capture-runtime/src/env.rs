@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
-use crate::config::VideoCodecPreference;
+use crate::config::{AudioCodecChoice, StreamBackpressure, VideoCodecPreference};
 use crate::params::{PipelineParams, RecordingOutputs};
 
 /// Build [`PipelineParams`] from CLI arguments plus `RS_CAPTURE_*` env overrides (file output only).
@@ -34,7 +34,9 @@ fn build_pipeline_params(
     let cfr_mux = cfr_mux_from_env();
     let av_drift_threshold_pcm_frames = av_drift_threshold_frames_from_env();
     let video_codec_preference = video_codec_preference_from_env();
+    let stream_backpressure = stream_backpressure_from_env();
     let remux_with_ffmpeg = std::env::var("RS_CAPTURE_FFMPEG_MUX").ok().as_deref() == Some("1");
+    let audio_codec = audio_codec_choice_from_env();
 
     PipelineParams {
         outputs,
@@ -47,7 +49,9 @@ fn build_pipeline_params(
         cfr_mux,
         av_drift_threshold_pcm_frames,
         video_codec_preference,
+        stream_backpressure,
         remux_with_ffmpeg,
+        audio_codec,
     }
 }
 
@@ -103,6 +107,29 @@ pub fn log_pipeline_startup(p: &PipelineParams) {
             );
         }
     }
+    match p.audio_codec {
+        AudioCodecChoice::AacLcMf => {
+            info!(
+                "Audio codec: AAC-LC (MF); default 192000 bps — RS_CAPTURE_AAC_BITRATE; RS_CAPTURE_AUDIO_CODEC=opus for Opus"
+            );
+        }
+        AudioCodecChoice::Opus => {
+            info!("Audio codec: Opus @ 48 kHz — clip.mp4 is video-only when writing files; Opus packets on stream");
+        }
+        AudioCodecChoice::PcmOnly => {
+            info!("Audio codec: PcmOnly (session only; runner does not support yet)");
+        }
+    }
+    if p.outputs.stream_senders().is_some() {
+        match p.stream_backpressure {
+            StreamBackpressure::Block => {
+                info!("Stream backpressure: block (wait for consumer; use bounded stream_pair for backpressure)");
+            }
+            StreamBackpressure::DropWhenFull => {
+                info!("Stream backpressure: drop when full (try_send; counts *_dropped_full in RunStats)");
+            }
+        }
+    }
     if p.fps != 30 {
         info!(
             "RS_CAPTURE_FPS={}: encoder and MP4 use this nominal rate (default 30)",
@@ -133,21 +160,68 @@ pub fn log_pipeline_startup(p: &PipelineParams) {
         info!("A/V drift watchdog off (default; audio timeline follows video ts_us). Set RS_CAPTURE_AV_DRIFT_SAMPLES to enable trim/pad");
     } else {
         info!(
-            "A/V drift watchdog: trim/pad when drift exceeds threshold (~{} + one AAC frame margin); may affect sound quality",
+            "A/V drift watchdog: trim/pad when drift exceeds threshold (~{} + one encoded audio frame margin); may affect sound quality",
             p.av_drift_threshold_pcm_frames
         );
     }
 }
 
+fn audio_codec_choice_from_env() -> AudioCodecChoice {
+    match std::env::var("RS_CAPTURE_AUDIO_CODEC").ok().as_deref() {
+        Some(s) if s.eq_ignore_ascii_case("opus") => AudioCodecChoice::Opus,
+        Some(s) if s.eq_ignore_ascii_case("aac") => AudioCodecChoice::AacLcMf,
+        _ => AudioCodecChoice::AacLcMf,
+    }
+}
+
+fn stream_backpressure_from_env() -> StreamBackpressure {
+    let Ok(raw) = std::env::var("RS_CAPTURE_STREAM_BACKPRESSURE") else {
+        return StreamBackpressure::Block;
+    };
+    let s = raw.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "" | "block" => StreamBackpressure::Block,
+        "drop" | "drop_when_full" | "try" => StreamBackpressure::DropWhenFull,
+        other => {
+            warn!(
+                "RS_CAPTURE_STREAM_BACKPRESSURE={other:?} unknown; use block or drop; using block"
+            );
+            StreamBackpressure::Block
+        }
+    }
+}
+
 fn video_codec_preference_from_env() -> VideoCodecPreference {
-    let force_sw = std::env::var("RS_CAPTURE_ENCODER")
+    video_codec_preference_from_tokens(
+        std::env::var("RS_CAPTURE_ENCODER").ok().as_deref(),
+        std::env::var("RS_CAPTURE_NVENC").ok().as_deref(),
+        std::env::var("RS_CAPTURE_NVENC_REQUIRED").ok().as_deref(),
+    )
+}
+
+/// Same token rules as `encoder::WindowsEncoderPreference::from_env_tokens` (aligned `RS_CAPTURE_*` vars).
+fn video_codec_preference_from_tokens(
+    rs_capture_encoder: Option<&str>,
+    rs_capture_nvenc: Option<&str>,
+    rs_capture_nvenc_required: Option<&str>,
+) -> VideoCodecPreference {
+    let force_sw = rs_capture_encoder
         .map(|s| s.eq_ignore_ascii_case("openh264"))
         .unwrap_or(false);
-    let skip_nvenc = std::env::var("RS_CAPTURE_NVENC")
+    let skip_nvenc = rs_capture_nvenc
         .map(|s| s == "0" || s.eq_ignore_ascii_case("off"))
         .unwrap_or(false);
     if force_sw || skip_nvenc {
-        VideoCodecPreference::PreferSoftware
+        return VideoCodecPreference::PreferSoftware;
+    }
+    if rs_capture_nvenc_required
+        .map(|s| {
+            let t = s.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+    {
+        VideoCodecPreference::RequireNvenc
     } else {
         VideoCodecPreference::Auto
     }
@@ -225,5 +299,35 @@ fn av_drift_threshold_frames_from_env() -> u64 {
         Ok(s) if s.trim().is_empty() => 0,
         Ok(s) => s.parse::<u64>().unwrap_or(0),
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod video_codec_env_tests {
+    use super::video_codec_preference_from_tokens;
+    use crate::config::VideoCodecPreference;
+
+    #[test]
+    fn token_defaults_match_auto() {
+        assert_eq!(
+            video_codec_preference_from_tokens(None, None, None),
+            VideoCodecPreference::Auto
+        );
+    }
+
+    #[test]
+    fn openh264_maps_to_prefer_software() {
+        assert_eq!(
+            video_codec_preference_from_tokens(Some("openh264"), None, None),
+            VideoCodecPreference::PreferSoftware
+        );
+    }
+
+    #[test]
+    fn nvenc_required_maps_to_require_nvenc() {
+        assert_eq!(
+            video_codec_preference_from_tokens(None, None, Some("yes")),
+            VideoCodecPreference::RequireNvenc
+        );
     }
 }
