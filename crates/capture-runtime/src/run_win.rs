@@ -239,6 +239,24 @@ enum AudioMsg {
     Error(String),
 }
 
+/// Gentle HF tilt so vocals/mids aren’t masked by bass-heavy fold-down; `0` / `off` disables.
+fn presence_emphasis_strength_from_env() -> f32 {
+    match std::env::var("RS_CAPTURE_PRESENCE_EMPHASIS").ok() {
+        None => 0.10,
+        Some(s) => {
+            let t = s.trim();
+            if t.is_empty() || t == "0" || t.eq_ignore_ascii_case("off") {
+                0.0
+            } else {
+                t.parse::<f32>()
+                    .ok()
+                    .filter(|&v| (0.0..=0.35).contains(&v))
+                    .unwrap_or(0.10)
+            }
+        }
+    }
+}
+
 fn audio_loopback_thread(stop: Arc<AtomicBool>, tx: Sender<AudioMsg>) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -288,6 +306,8 @@ pub(crate) fn run_file_recording(
     let mut stream_video_packets_dropped_full: u64 = 0;
     let mut stream_audio_chunks_dropped_full: u64 = 0;
     let stream_bp = params.stream_backpressure;
+    let presence_emphasis = presence_emphasis_strength_from_env();
+    let mut audio_presence_prev = vec![0.0f32; 2];
 
     info!("Creating D3D11 device…");
     let D3d11Context { device, context } = create_d3d11_device()?;
@@ -798,6 +818,14 @@ pub(crate) fn run_file_recording(
                                         audio_pcm_channels as usize,
                                     );
                                 }
+                                if presence_emphasis > 0.0 {
+                                    audio::emphasis_interleaved_f32_inplace(
+                                        &mut chunk.samples_f32,
+                                        audio_mix_channels as usize,
+                                        &mut audio_presence_prev,
+                                        presence_emphasis,
+                                    );
+                                }
                                 if chunk.samples_f32.is_empty() {
                                     continue;
                                 }
@@ -922,6 +950,14 @@ pub(crate) fn run_file_recording(
                         chunk.samples_f32 = audio::downmix_interleaved_f32_to_stereo(
                             &chunk.samples_f32,
                             audio_pcm_channels as usize,
+                        );
+                    }
+                    if presence_emphasis > 0.0 {
+                        audio::emphasis_interleaved_f32_inplace(
+                            &mut chunk.samples_f32,
+                            audio_mix_channels as usize,
+                            &mut audio_presence_prev,
+                            presence_emphasis,
                         );
                     }
                     if chunk.samples_f32.is_empty() {
