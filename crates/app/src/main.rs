@@ -1,4 +1,5 @@
 //! WGC capture + OpenH264 + WASAPI: H.264 + AAC in `clip.mp4` (Media Foundation), WAV debug, optional ffmpeg remux.
+//! Optional: `RS_CAPTURE_CFR=1` (fixed-duration video samples), `RS_CAPTURE_AV_DRIFT_SAMPLES` (A/V trim/pad).
 
 mod encode_async;
 
@@ -95,6 +96,26 @@ fn async_nvenc_encode_from_env() -> bool {
     }
 }
 
+/// Constant frame rate in the MP4: each wall-clock gap is filled with repeated Annex-B packets at
+/// nominal duration (helps editors that dislike VFR). `RS_CAPTURE_CFR=0` keeps variable durations.
+fn cfr_mux_from_env() -> bool {
+    match std::env::var("RS_CAPTURE_CFR") {
+        Ok(s) if s == "1" || s.eq_ignore_ascii_case("on") || s.eq_ignore_ascii_case("true") => true,
+        Ok(_) => false,
+        Err(_) => false,
+    }
+}
+
+/// Whole PCM frames (per-channel timeline) before correcting A/V drift. `0` disables the watchdog.
+/// Default **480** (~10 ms at 48 kHz). Set `RS_CAPTURE_AV_DRIFT_SAMPLES=0` to turn off.
+fn av_drift_threshold_frames_from_env() -> u64 {
+    match std::env::var("RS_CAPTURE_AV_DRIFT_SAMPLES") {
+        Ok(s) if s.trim().is_empty() => 480,
+        Ok(s) => s.parse::<u64>().unwrap_or(480),
+        Err(_) => 480,
+    }
+}
+
 enum AudioMsg {
     Ready {
         sample_rate: u32,
@@ -176,6 +197,8 @@ fn main() -> anyhow::Result<()> {
     let bitrate_bps = video_bitrate_bps();
     let frame_pacing = frame_pacing_from_env();
     let async_nvenc_wanted = async_nvenc_encode_from_env();
+    let cfr_mux = cfr_mux_from_env();
+    let av_drift_threshold_frames = av_drift_threshold_frames_from_env();
     if fps != 30 {
         info!("RS_CAPTURE_FPS={fps}: encoder and MP4 use this nominal rate (default 30)");
     }
@@ -192,6 +215,17 @@ fn main() -> anyhow::Result<()> {
         info!("RS_CAPTURE_FRAME_PACING=0: no sleep between frames (max capture rate, rougher VFR)");
     } else {
         info!("Frame pacing on (RS_CAPTURE_FRAME_PACING=0 to disable) — targets ~{fps} pulls/sec wall clock");
+    }
+    if cfr_mux {
+        info!("RS_CAPTURE_CFR=1: MP4 video uses fixed sample duration with duplicate frames for gaps");
+    }
+    if av_drift_threshold_frames == 0 {
+        info!("RS_CAPTURE_AV_DRIFT_SAMPLES=0: A/V drift watchdog disabled");
+    } else {
+        info!(
+            "A/V drift watchdog: trim/pad when muxed audio vs video differs by > {} PCM frames (RS_CAPTURE_AV_DRIFT_SAMPLES=0 to disable)",
+            av_drift_threshold_frames
+        );
     }
     std::fs::create_dir_all(&out_dir).with_context(|| format!("create_dir_all {out_dir}"))?;
 
@@ -235,6 +269,12 @@ fn main() -> anyhow::Result<()> {
     // Drop this many PCM frames (per-channel time slots) from the start so MP4 audio matches frame 0.
     let mut pending_audio_frame_skip: u64 = 0;
     let mut audio_frame_skip_bootstrapped = false;
+    // Cumulative video track duration in MP4 timescale ticks (sum of each written sample duration).
+    let mut muxed_video_duration_ts: u64 = 0;
+    // AAC timeline in PCM samples (per channel), i.e. sum of `samples_per_access_unit` muxed.
+    let mut muxed_audio_samples: u64 = 0;
+    // Pad this many all-zero PCM frames at the start of the next chunk(s) to slow audio vs video.
+    let mut pending_silence_pcm_frames: u64 = 0;
     // If NVENC fails with a device/API mismatch, swap to OpenH264 once (do not match generic
     // `encode_picture` errors — e.g. NeedMoreInput was wrongly swapping to CPU encode).
     let mut nvenc_swapped_to_openh264 = false;
@@ -521,26 +561,46 @@ fn main() -> anyhow::Result<()> {
                         .encode_i420(&i420, ts_us)
                         .context("encode_i420")?
                 };
-                h264_out
-                    .as_mut()
-                    .unwrap()
-                    .write_all(&pkt.data)
-                    .context("write clip.h264")?;
-
                 let mp4 = mp4_out.as_mut().unwrap();
                 let v_ts = mp4.video_timescale();
                 let nominal = std::cmp::max(1u32, v_ts / fps);
                 let max_dur = nominal.saturating_mul(10);
-                let duration_ts = if saved == 0 {
+                let gap_ts = if saved == 0 {
                     nominal
                 } else {
-                    let delta_us = ts_us.saturating_sub(last_ts_us);
-                    duration_ts_from_delta_us(delta_us, v_ts, max_dur)
+                    duration_ts_from_delta_us(ts_us.saturating_sub(last_ts_us), v_ts, max_dur)
                 };
                 last_ts_us = ts_us;
 
-                mp4.write_annex_b_frame_with_duration(&pkt.data, pkt.is_keyframe, duration_ts)
-                    .context("write clip.mp4")?;
+                let h264 = h264_out.as_mut().unwrap();
+                if cfr_mux {
+                    let max_slots = fps.saturating_mul(600).max(1);
+                    let slots_u64 = (u64::from(gap_ts) + u64::from(nominal) - 1) / u64::from(nominal);
+                    let slots = u32::try_from(slots_u64.max(1))
+                        .unwrap_or(u32::MAX)
+                        .min(max_slots);
+                    for slot_idx in 0..slots {
+                        let key = pkt.is_keyframe && slot_idx == 0;
+                        h264
+                            .write_all(&pkt.data)
+                            .context("write clip.h264")?;
+                        mp4
+                            .write_annex_b_frame_with_duration(&pkt.data, key, nominal)
+                            .context("write clip.mp4 (CFR)")?;
+                        muxed_video_duration_ts =
+                            muxed_video_duration_ts.saturating_add(u64::from(nominal));
+                    }
+                } else {
+                    let duration_ts = gap_ts;
+                    h264
+                        .write_all(&pkt.data)
+                        .context("write clip.h264")?;
+                    mp4
+                        .write_annex_b_frame_with_duration(&pkt.data, pkt.is_keyframe, duration_ts)
+                        .context("write clip.mp4")?;
+                    muxed_video_duration_ts =
+                        muxed_video_duration_ts.saturating_add(u64::from(duration_ts));
+                }
 
                 if let Some(rx) = audio_rx.as_ref() {
                     if !audio_frame_skip_bootstrapped && audio_sample_rate > 0 {
@@ -554,6 +614,11 @@ fn main() -> anyhow::Result<()> {
                                     &mut chunk.samples_f32,
                                     audio_pcm_channels,
                                     &mut pending_audio_frame_skip,
+                                );
+                                prepend_silence_pcm_frames_front(
+                                    &mut chunk.samples_f32,
+                                    audio_pcm_channels,
+                                    &mut pending_silence_pcm_frames,
                                 );
                                 if chunk.samples_f32.is_empty() {
                                     continue;
@@ -571,6 +636,8 @@ fn main() -> anyhow::Result<()> {
                                         mp4
                                             .write_aac_access_unit(&au, 1024)
                                             .context("write AAC to MP4")?;
+                                        muxed_audio_samples =
+                                            muxed_audio_samples.saturating_add(1024);
                                     }
                                 }
                             }
@@ -583,6 +650,21 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                }
+
+                if av_drift_threshold_frames > 0
+                    && audio_sample_rate > 0
+                    && aac_enc.is_some()
+                {
+                    reconcile_mux_av_drift(
+                        muxed_video_duration_ts,
+                        muxed_audio_samples,
+                        v_ts,
+                        audio_sample_rate,
+                        av_drift_threshold_frames,
+                        &mut pending_silence_pcm_frames,
+                        &mut pending_audio_frame_skip,
+                    );
                 }
 
                 if let Some(targets) = targets_opt {
@@ -623,6 +705,7 @@ fn main() -> anyhow::Result<()> {
     stop.store(true, Ordering::SeqCst);
     if let Some(rx) = audio_rx.take() {
         if let Some(mp4) = mp4_out.as_mut() {
+            let v_ts_shutdown = mp4.video_timescale();
             for msg in rx.try_iter() {
                 match msg {
                     AudioMsg::Chunk(mut chunk) => {
@@ -630,6 +713,11 @@ fn main() -> anyhow::Result<()> {
                             &mut chunk.samples_f32,
                             audio_pcm_channels,
                             &mut pending_audio_frame_skip,
+                        );
+                        prepend_silence_pcm_frames_front(
+                            &mut chunk.samples_f32,
+                            audio_pcm_channels,
+                            &mut pending_silence_pcm_frames,
                         );
                         if chunk.samples_f32.is_empty() {
                             continue;
@@ -647,12 +735,25 @@ fn main() -> anyhow::Result<()> {
                                 mp4
                                     .write_aac_access_unit(&au, 1024)
                                     .context("shutdown drain: MP4 AAC")?;
+                                muxed_audio_samples =
+                                    muxed_audio_samples.saturating_add(1024);
                             }
                         }
                     }
                     AudioMsg::Error(e) => warn!("audio thread (shutdown drain): {e}"),
                     AudioMsg::Ready { .. } => {}
                 }
+            }
+            if av_drift_threshold_frames > 0 && audio_sample_rate > 0 && aac_enc.is_some() {
+                reconcile_mux_av_drift(
+                    muxed_video_duration_ts,
+                    muxed_audio_samples,
+                    v_ts_shutdown,
+                    audio_sample_rate,
+                    av_drift_threshold_frames,
+                    &mut pending_silence_pcm_frames,
+                    &mut pending_audio_frame_skip,
+                );
             }
         }
     }
@@ -666,6 +767,7 @@ fn main() -> anyhow::Result<()> {
                 mp4
                     .write_aac_access_unit(&au, 1024)
                     .context("write final AAC samples")?;
+                muxed_audio_samples = muxed_audio_samples.saturating_add(1024);
             }
         }
     }
@@ -724,6 +826,53 @@ fn try_mux_with_ffmpeg(video_mp4: &str, audio_wav: &str, output_mp4: &str) -> an
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).context("spawn ffmpeg"),
+    }
+}
+
+/// Pad interleaved PCM with leading silence (`pending_frames` whole PCM frames across channels).
+fn prepend_silence_pcm_frames_front(
+    samples: &mut Vec<f32>,
+    channels: u16,
+    pending_frames: &mut u64,
+) {
+    let ch = channels as usize;
+    if *pending_frames == 0 || ch == 0 {
+        return;
+    }
+    let take = (*pending_frames as usize).min(48_000);
+    let mut prefix = vec![0.0f32; take * ch];
+    if samples.is_empty() {
+        *samples = prefix;
+    } else {
+        prefix.append(samples);
+        *samples = prefix;
+    }
+    *pending_frames -= take as u64;
+}
+
+/// Keeps muxed AAC timeline aligned with muxed video duration (round-trip remainder vs AAC framing).
+const DRIFT_CORRECT_MAX_STEP: u64 = 4800;
+
+fn reconcile_mux_av_drift(
+    muxed_video_duration_ts: u64,
+    muxed_audio_samples: u64,
+    v_ts: u32,
+    sample_rate: u32,
+    threshold: u64,
+    pending_silence_pcm_frames: &mut u64,
+    pending_audio_frame_skip: &mut u64,
+) {
+    if threshold == 0 || sample_rate == 0 || v_ts == 0 {
+        return;
+    }
+    let want = (muxed_video_duration_ts as u128 * sample_rate as u128 / v_ts as u128) as u64;
+    let delta = want as i128 - muxed_audio_samples as i128;
+    if delta > threshold as i128 {
+        let add = (delta as u64).min(DRIFT_CORRECT_MAX_STEP);
+        *pending_silence_pcm_frames = pending_silence_pcm_frames.saturating_add(add);
+    } else if delta < -(threshold as i128) {
+        let trim = ((-delta) as u64).min(DRIFT_CORRECT_MAX_STEP);
+        *pending_audio_frame_skip = pending_audio_frame_skip.saturating_add(trim);
     }
 }
 
