@@ -1,17 +1,12 @@
 //! Embeddable capture **runtime API** for hosts such as `capture-pipeline` CLI, MyCord, or tray apps.
 //!
-//! ## Integration model
+//! ## Library recording entrypoint (Windows)
 //!
-//! - **Today:** The heavy implementation still lives in the `capture-pipeline-app` binary (`main.rs`).
-//!   This crate defines **stable types and contracts** other projects depend on. The next step is to
-//!   move the loop into a `runner` module (same repo) and call it from both the CLI and your app.
-//!
-//! - **MyCord path:** Call [`stream_pair`], build [`SessionConfig::with_stream_endpoints`], then run
-//!   the session (once wired). Encoded **Annex-B H.264** ([`VideoPacket`]) and audio ([`AudioChunk`])
-//!   are sent on bounded channels; your WebSocket task reads from the receivers.
-//!
-//! - **Extra video backends** (AMF, QSV, x264, …): stay behind the existing `encoder::VideoEncoder`
-//!   trait in the `encoder` crate; the runner selects backends from [`VideoCodecPreference`].
+//! ```ignore
+//! let params = capture_runtime::pipeline_params_from_cli_and_env("capture_out", 0, true);
+//! let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+//! let stats = capture_runtime::run_file_recording(&params, stop)?;
+//! ```
 //!
 //! ## Cargo.toml in another repo (path dependency)
 //!
@@ -21,11 +16,40 @@
 //! ```
 
 pub mod config;
+pub mod env;
 pub mod error;
 pub mod events;
+pub mod params;
+
+#[cfg(windows)]
+pub mod encode_async;
+
+#[cfg(windows)]
+mod run_win;
 
 pub use config::{
     stream_pair, AudioCodecChoice, OutputTarget, SessionConfig, VideoCodecPreference,
 };
+pub use env::{log_pipeline_startup, pipeline_params_from_cli_and_env};
 pub use error::RuntimeError;
 pub use events::{AudioChunk, StreamClock, VideoPacket};
+pub use params::{PipelineParams, RunStats};
+
+/// Run a full **file** recording session (WGC → encode → `clip.mp4` / `clip.h264` / `audio.wav`).
+///
+/// **Windows only.** Call after COM init on the main thread if you use audio/MF (see CLI binary).
+#[cfg(windows)]
+pub fn run_file_recording(
+    params: &PipelineParams,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<RunStats> {
+    run_win::run_file_recording(params, stop)
+}
+
+#[cfg(not(windows))]
+pub fn run_file_recording(
+    _params: &PipelineParams,
+    _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<RunStats> {
+    anyhow::bail!("capture-runtime file recording is only implemented on Windows")
+}

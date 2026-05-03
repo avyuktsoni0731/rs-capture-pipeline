@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::events::{AudioChunk, VideoPacket};
 
 /// Where encoded media goes. Extend with `Rtmp`, `Webrtc`, etc. as you add sinks.
+///
+/// Not serialized as a whole when using [`OutputTarget::StreamOnly`] (contains channel senders).
 #[derive(Debug)]
-#[cfg_attr(feature = "serde_config", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde_config", serde(tag = "kind", rename_all = "snake_case"))]
 pub enum OutputTarget {
     /// Write `clip.h264`, `clip.mp4`, `audio.wav` under this directory (current CLI behavior).
     Files {

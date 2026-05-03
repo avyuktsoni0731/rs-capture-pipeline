@@ -6,9 +6,20 @@ description = "Embeddable screen/audio capture orchestration API for hosts (CLI,
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+anyhow.workspace = true
 crossbeam-channel.workspace = true
+tracing.workspace = true
 serde = { workspace = true, optional = true }
 thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+capture = { path = "../capture" }
+pipeline = { path = "../pipeline" }
+encoder = { path = "../encoder" }
+output = { path = "../output" }
+audio = { path = "../audio" }
+audio_encoder = { path = "../audio_encoder" }
+windows.workspace = true
 
 [features]
 default = []
