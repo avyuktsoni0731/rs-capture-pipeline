@@ -1,0 +1,15 @@
+[package]
+name = "capture-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Embeddable screen/audio capture orchestration API for hosts (CLI, MyCord, tray apps)."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+crossbeam-channel.workspace = true
+serde = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[features]
+default = []
+serde_config = ["dep:serde", "serde/derive"]
