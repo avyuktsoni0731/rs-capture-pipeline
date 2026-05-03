@@ -70,6 +70,18 @@ fn video_bitrate_bps() -> u32 {
     }
 }
 
+/// Sleep between encoded frames so we do not out-run nominal FPS (helps mux cadence vs burst capture).
+/// Disable max throughput / stress tests: `RS_CAPTURE_FRAME_PACING=0`.
+fn frame_pacing_from_env() -> bool {
+    match std::env::var("RS_CAPTURE_FRAME_PACING") {
+        Ok(s) if s == "0" || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("false") => {
+            false
+        }
+        Ok(_) => true,
+        Err(_) => true,
+    }
+}
+
 enum AudioMsg {
     Ready {
         sample_rate: u32,
@@ -149,6 +161,7 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(true);
     let fps = capture_fps_from_env();
     let bitrate_bps = video_bitrate_bps();
+    let frame_pacing = frame_pacing_from_env();
     if fps != 30 {
         info!("RS_CAPTURE_FPS={fps}: encoder and MP4 use this nominal rate (default 30)");
     }
@@ -161,6 +174,11 @@ fn main() -> anyhow::Result<()> {
             "default ~OBS-class 45 Mbps; set RS_CAPTURE_VIDEO_BITRATE to override"
         }
     );
+    if !frame_pacing {
+        info!("RS_CAPTURE_FRAME_PACING=0: no sleep between frames (max capture rate, rougher VFR)");
+    } else {
+        info!("Frame pacing on (RS_CAPTURE_FRAME_PACING=0 to disable) — targets ~{fps} pulls/sec wall clock");
+    }
     std::fs::create_dir_all(&out_dir).with_context(|| format!("create_dir_all {out_dir}"))?;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -510,6 +528,21 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 saved += 1;
+
+                // Pace wall-clock spacing toward nominal FPS so we don't burst-process compositor
+                // frames faster than ~fps/sec (smoother sample spacing vs pure VFR). Cannot invent
+                // GPU frames; heavy scenes still drop below target FPS.
+                if frame_pacing && fps > 0 {
+                    if let Some(anchor) = video_t0 {
+                        let target_end =
+                            anchor + Duration::from_secs_f64(saved as f64 / fps as f64);
+                        let now = Instant::now();
+                        if let Some(delay) = target_end.checked_duration_since(now) {
+                            std::thread::sleep(delay);
+                        }
+                    }
+                }
+
                 if saved > 0 && saved % (fps * 10).max(1) == 0 {
                     info!("Recorded {} video frames...", saved);
                 }
