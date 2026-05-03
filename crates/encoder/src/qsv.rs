@@ -33,12 +33,12 @@ pub fn intel_adapter_present() -> bool {
 
 /// Try Intel Quick Sync–class encode: **MF hardware H.264** with NV12 input (see [`crate::mf_h264_hw::MfH264HwEncoder`]).
 ///
-/// `device` is reserved for a future D3D11 device-manager path; today encoding uses system-memory NV12.
+/// `device` is passed into Media Foundation as an DXGI device manager when supported (`MFT_MESSAGE_SET_D3D_MANAGER`).
 pub(crate) fn try_create_qsv_encoder(
-    _device: &ID3D11Device,
+    device: &ID3D11Device,
     config: &EncoderConfig,
 ) -> anyhow::Result<Box<dyn VideoEncoder>> {
-    let enc = crate::mf_h264_hw::MfH264HwEncoder::try_new(config)?;
+    let enc = crate::mf_h264_hw::MfH264HwEncoder::try_new(config, Some(device))?;
     Ok(Box::new(enc))
 }
 

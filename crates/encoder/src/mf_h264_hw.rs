@@ -2,24 +2,35 @@
 //!
 //! Uses **system-memory NV12** input — pairs with the capture pipeline’s existing `encode_i420` path
 //! (I420 → NV12 → MFT). Does not use `encode_bgra_texture` (NVENC-style).
+//!
+//! When a D3D11 device is supplied (Quick Sync path), the MFT receives an DXGI device manager via
+//! `MFT_MESSAGE_SET_D3D_MANAGER` so the driver can match GPU residency. [`encode_i420`] requests
+//! periodic IDRs through [`CODECAPI_AVEncVideoForceKeyFrame`] when [`ICodecAPI`] is exposed.
+//! `MF_E_TRANSFORM_STREAM_CHANGE` on input/output is handled by re-applying NV12/H.264 types.
 
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Context;
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFMediaType, IMFTransform, MFCreateAlignedMemoryBuffer, MFCreateMediaType,
-    MFCreateMemoryBuffer, MFCreateSample, MFShutdown, MFStartup, MF_E_NO_MORE_TYPES,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION,
-    MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-    MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFSTARTUP_FULL, MFTEnumEx,
+    CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate, IMFMediaType, IMFTransform,
+    IMFDXGIDeviceManager, MFCreateAlignedMemoryBuffer, MFCreateDXGIDeviceManager,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFShutdown, MFStartup,
+    MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
+    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_SUBTYPE, MF_VERSION, MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12,
+    MFVideoInterlace_Progressive, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER,
+    MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFSTARTUP_FULL,
+    MFTEnumEx,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Variant::{InitVariantFromBooleanArray, VariantClear};
+use windows::core::{BOOL, Interface};
 
 use crate::traits::{EncodedPacket, VideoCodec, VideoEncoder};
 
@@ -28,25 +39,39 @@ static MF_INIT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Hardware / MF H.264 encoder (Quick Sync path on Intel when the driver registers an HW MFT).
 /// MF APIs are not `Send`; capture runs this encoder on one thread (same as NVENC policy).
 pub struct MfH264HwEncoder {
-    mft: IMFTransform,
+    codec_api: Option<ICodecAPI>,
     width: u32,
     height: u32,
     fps: u32,
+    bitrate_bps: u32,
     frame_index: u64,
     next_input_hns: i64,
     caller_output_sample: bool,
     output_buffer_capacity: u32,
     output_buffer_alignment: u32,
+    gop_frames: u32,
+    /// DXGI device manager for `MFT_MESSAGE_SET_D3D_MANAGER`; released after [`Self::mft`] (field order).
+    _dxgi_manager: Option<IMFDXGIDeviceManager>,
+    mft: IMFTransform,
 }
 
 unsafe impl Send for MfH264HwEncoder {}
 
 impl MfH264HwEncoder {
-    pub fn try_new(config: &crate::EncoderConfig) -> anyhow::Result<Self> {
+    /// Build an MF hardware H.264 transform.
+    ///
+    /// Pass `d3d_device` when the pipeline already holds the capture D3D11 device so the encoder MFT
+    /// can bind through DXGI (`MFT_MESSAGE_SET_D3D_MANAGER`). Omit on hosts where only system-memory
+    /// NV12 is available.
+    pub fn try_new(
+        config: &crate::EncoderConfig,
+        d3d_device: Option<&ID3D11Device>,
+    ) -> anyhow::Result<Self> {
         let width = config.width;
         let height = config.height;
         let fps = config.fps.max(1);
         let bitrate_bps = config.bitrate_bps;
+        let gop_frames = fps.saturating_mul(2).max(30);
 
         anyhow::ensure!(
             width % 2 == 0 && height % 2 == 0,
@@ -59,7 +84,18 @@ impl MfH264HwEncoder {
             }
         }
 
-        let mft = unsafe { enum_activate_hardware_encoder(width, height, fps, bitrate_bps)? };
+        let dxgi_manager = if let Some(dev) = d3d_device {
+            Some(unsafe { create_dxgi_device_manager(dev)? })
+        } else {
+            None
+        };
+
+        let dxgi_ref = dxgi_manager.as_ref();
+        let mft = unsafe {
+            enum_activate_hardware_encoder(width, height, fps, bitrate_bps, dxgi_ref)?
+        };
+
+        let codec_api = mft.cast::<ICodecAPI>().ok();
 
         let caller_output_sample;
         let output_buffer_capacity;
@@ -91,25 +127,87 @@ impl MfH264HwEncoder {
         }
 
         tracing::info!(
-            "Using Media Foundation hardware H.264 at {}x{} @ {} fps, {} bps (NV12 in, Annex-B out)",
+            "Using Media Foundation hardware H.264 at {}x{} @ {} fps, {} bps (NV12 in, Annex-B out{}, GOP ~{} frames)",
             width,
             height,
             fps,
-            bitrate_bps
+            bitrate_bps,
+            if dxgi_manager.is_some() {
+                ", DXGI device manager"
+            } else {
+                ""
+            },
+            gop_frames
         );
 
         Ok(Self {
-            mft,
+            codec_api,
             width,
             height,
             fps,
+            bitrate_bps,
             frame_index: 0,
             next_input_hns: 0,
             caller_output_sample,
             output_buffer_capacity,
             output_buffer_alignment,
+            gop_frames,
+            _dxgi_manager: dxgi_manager,
+            mft,
         })
     }
+
+    fn refresh_output_allocation(&mut self) -> anyhow::Result<()> {
+        unsafe {
+            let out_info = self
+                .mft
+                .GetOutputStreamInfo(0)
+                .context("GetOutputStreamInfo after stream change")?;
+            let flags = out_info.dwFlags;
+            let mft_provides = (flags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
+            let mft_can_provide = (flags & MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32) != 0;
+            self.caller_output_sample = !mft_provides && !mft_can_provide;
+            self.output_buffer_capacity = if out_info.cbSize == 0 {
+                self.width
+                    .saturating_mul(self.height)
+                    .saturating_mul(3)
+                    .saturating_div(2)
+                    .saturating_add(65_536)
+            } else {
+                out_info.cbSize
+            };
+            self.output_buffer_alignment = out_info.cbAlignment.max(1);
+        }
+        Ok(())
+    }
+
+    /// Re-apply NV12 input + H.264 output after `MF_E_TRANSFORM_STREAM_CHANGE`.
+    fn reconfigure_streams(&mut self) -> anyhow::Result<()> {
+        unsafe {
+            self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0).ok();
+            apply_nv12_input_type(&self.mft, self.width, self.height, self.fps)
+                .context("stream change: SetInputType NV12")?;
+            try_set_h264_output_type(&self.mft, self.width, self.height, self.fps, self.bitrate_bps)
+                .context("stream change: SetOutputType H264")?;
+            self.refresh_output_allocation()?;
+            self.mft
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+                .context("stream change: NOTIFY_BEGIN_STREAMING")?;
+            self.mft
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+                .context("stream change: NOTIFY_START_OF_STREAM")?;
+        }
+        Ok(())
+    }
+}
+
+unsafe fn create_dxgi_device_manager(device: &ID3D11Device) -> anyhow::Result<IMFDXGIDeviceManager> {
+    let mut reset_token: u32 = 0;
+    let mut manager: Option<IMFDXGIDeviceManager> = None;
+    MFCreateDXGIDeviceManager(&mut reset_token, &mut manager).context("MFCreateDXGIDeviceManager")?;
+    let mgr = manager.context("MFCreateDXGIDeviceManager returned null")?;
+    mgr.ResetDevice(device, reset_token).context("IMFDXGIDeviceManager::ResetDevice")?;
+    Ok(mgr)
 }
 
 /// Enumerate hardware video encoders; pick the first H.264 MFT that accepts our NV12 → H264 types.
@@ -118,6 +216,7 @@ unsafe fn enum_activate_hardware_encoder(
     height: u32,
     fps: u32,
     bitrate_bps: u32,
+    dxgi_manager: Option<&IMFDXGIDeviceManager>,
 ) -> anyhow::Result<IMFTransform> {
     let flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
 
@@ -149,7 +248,7 @@ unsafe fn enum_activate_hardware_encoder(
             None => continue,
         };
 
-        match try_configure_mft(&act, width, height, fps, bitrate_bps) {
+        match try_configure_mft(&act, width, height, fps, bitrate_bps, dxgi_manager) {
             Ok(mft) => {
                 for j in (i + 1)..count {
                     let _ = (*ptr.add(j as usize)).take();
@@ -171,20 +270,12 @@ unsafe fn enum_activate_hardware_encoder(
     Err(last_err)
 }
 
-unsafe fn try_configure_mft(
-    act: &IMFActivate,
+unsafe fn apply_nv12_input_type(
+    mft: &IMFTransform,
     width: u32,
     height: u32,
     fps: u32,
-    bitrate_bps: u32,
-) -> anyhow::Result<IMFTransform> {
-    let mft: IMFTransform = act
-        .ActivateObject::<IMFTransform>()
-        .context("ActivateObject IMFTransform")?;
-
-    mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0).ok();
-
-    // Input: NV12 @ WxH
+) -> anyhow::Result<()> {
     let input: IMFMediaType = MFCreateMediaType().context("MFCreateMediaType input")?;
     input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
     input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
@@ -198,14 +289,25 @@ unsafe fn try_configure_mft(
     )?;
     mft.SetInputType(0, &input, 0)
         .context("SetInputType NV12")?;
+    Ok(())
+}
 
-    // Output: H.264 elementary stream
+unsafe fn try_set_h264_output_type(
+    mft: &IMFTransform,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_bps: u32,
+) -> anyhow::Result<()> {
+    let fs = (u64::from(width) << 32) | u64::from(height);
+    let fr = (u64::from(fps) << 32) | 1u64;
     let mut out_idx = 0u32;
-    let mut configured = false;
     loop {
         let out_partial = match mft.GetOutputAvailableType(0, out_idx) {
             Ok(t) => t,
-            Err(e) if e.code() == MF_E_NO_MORE_TYPES => break,
+            Err(e) if e.code() == MF_E_NO_MORE_TYPES => {
+                anyhow::bail!("MFT has no H.264 compressed output type");
+            }
             Err(e) => return Err(e).context("GetOutputAvailableType")?,
         };
         let st = out_partial.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
@@ -223,15 +325,35 @@ unsafe fn try_configure_mft(
             out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_bps)
                 .context("MF_MT_AVG_BITRATE")?;
             mft.SetOutputType(0, &out, 0).context("SetOutputType H264")?;
-            configured = true;
-            break;
+            return Ok(());
         }
         out_idx += 1;
     }
+}
 
-    if !configured {
-        anyhow::bail!("MFT has no H.264 compressed output type");
+unsafe fn try_configure_mft(
+    act: &IMFActivate,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_bps: u32,
+    dxgi_manager: Option<&IMFDXGIDeviceManager>,
+) -> anyhow::Result<IMFTransform> {
+    let mft: IMFTransform = act
+        .ActivateObject::<IMFTransform>()
+        .context("ActivateObject IMFTransform")?;
+
+    mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0).ok();
+
+    if let Some(dm) = dxgi_manager {
+        mft
+            .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, dm.as_raw() as usize)
+            .context("MFT_MESSAGE_SET_D3D_MANAGER")?;
     }
+
+    apply_nv12_input_type(&mft, width, height, fps)
+        .context("SetInputType NV12")?;
+    try_set_h264_output_type(&mft, width, height, fps, bitrate_bps)?;
 
     Ok(mft)
 }
@@ -318,6 +440,14 @@ fn annex_b_keyframe(annex_b: &[u8]) -> bool {
     false
 }
 
+unsafe fn request_idr_from_codec_api(codec_api: &ICodecAPI) -> anyhow::Result<()> {
+    let mut v = InitVariantFromBooleanArray(&[BOOL::from(true)]).context("InitVariant IDR")?;
+    let hr = codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
+    let _ = VariantClear(&mut v);
+    hr.context("CODECAPI_AVEncVideoForceKeyFrame")?;
+    Ok(())
+}
+
 impl VideoEncoder for MfH264HwEncoder {
     fn encode_i420(&mut self, i420: &[u8], timestamp_us: u64) -> anyhow::Result<EncodedPacket> {
         let w = self.width as usize;
@@ -325,6 +455,14 @@ impl VideoEncoder for MfH264HwEncoder {
         let nv12 = i420_to_nv12(i420, w, h)?;
 
         let frame_hns = (10_000_000i64 / i64::from(self.fps)).max(1);
+
+        let want_idr = self.frame_index == 0
+            || self.frame_index % u64::from(self.gop_frames.max(1)) == 0;
+        if want_idr {
+            if let Some(ref api) = self.codec_api {
+                unsafe { request_idr_from_codec_api(api)? };
+            }
+        }
 
         unsafe {
             let buf = MFCreateMemoryBuffer(nv12.len() as u32).context("MFCreateMemoryBuffer NV12")?;
@@ -341,9 +479,23 @@ impl VideoEncoder for MfH264HwEncoder {
             sample.SetSampleTime(self.next_input_hns)?;
             sample.SetSampleDuration(frame_hns)?;
 
-            self.mft
-                .ProcessInput(0, &sample, 0)
-                .context("ProcessInput H264 MFT")?;
+            let mut submitted = false;
+            for _ in 0..8 {
+                match self.mft.ProcessInput(0, &sample, 0) {
+                    Ok(()) => {
+                        submitted = true;
+                        break;
+                    }
+                    Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                        self.reconfigure_streams()?;
+                    }
+                    Err(e) => return Err(e).context("ProcessInput H264 MFT"),
+                }
+            }
+            anyhow::ensure!(
+                submitted,
+                "MF H.264: ProcessInput did not succeed after stream-change retries"
+            );
         }
 
         self.next_input_hns = self
@@ -351,6 +503,7 @@ impl VideoEncoder for MfH264HwEncoder {
             .saturating_add(frame_hns);
 
         let mut accumulated = Vec::new();
+        let mut output_stream_change_recovery = 0u32;
         loop {
             let mut buf = MFT_OUTPUT_DATA_BUFFER {
                 dwStreamID: 0,
@@ -387,6 +540,15 @@ impl VideoEncoder for MfH264HwEncoder {
             if let Err(e) = hr {
                 if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT {
                     break;
+                }
+                if e.code() == MF_E_TRANSFORM_STREAM_CHANGE {
+                    output_stream_change_recovery += 1;
+                    anyhow::ensure!(
+                        output_stream_change_recovery <= 8,
+                        "MF H.264: too many stream-change recoveries on ProcessOutput"
+                    );
+                    self.reconfigure_streams()?;
+                    continue;
                 }
                 return Err(e).context("ProcessOutput H264 MFT");
             }
