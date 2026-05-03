@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
-use crate::config::VideoCodecPreference;
+use crate::config::{StreamBackpressure, VideoCodecPreference};
 use crate::params::{PipelineParams, RecordingOutputs};
 
 /// Build [`PipelineParams`] from CLI arguments plus `RS_CAPTURE_*` env overrides (file output only).
@@ -34,6 +34,7 @@ fn build_pipeline_params(
     let cfr_mux = cfr_mux_from_env();
     let av_drift_threshold_pcm_frames = av_drift_threshold_frames_from_env();
     let video_codec_preference = video_codec_preference_from_env();
+    let stream_backpressure = stream_backpressure_from_env();
     let remux_with_ffmpeg = std::env::var("RS_CAPTURE_FFMPEG_MUX").ok().as_deref() == Some("1");
 
     PipelineParams {
@@ -47,6 +48,7 @@ fn build_pipeline_params(
         cfr_mux,
         av_drift_threshold_pcm_frames,
         video_codec_preference,
+        stream_backpressure,
         remux_with_ffmpeg,
     }
 }
@@ -103,6 +105,16 @@ pub fn log_pipeline_startup(p: &PipelineParams) {
             );
         }
     }
+    if p.outputs.stream_senders().is_some() {
+        match p.stream_backpressure {
+            StreamBackpressure::Block => {
+                info!("Stream backpressure: block (wait for consumer; use bounded stream_pair for backpressure)");
+            }
+            StreamBackpressure::DropWhenFull => {
+                info!("Stream backpressure: drop when full (try_send; counts *_dropped_full in RunStats)");
+            }
+        }
+    }
     if p.fps != 30 {
         info!(
             "RS_CAPTURE_FPS={}: encoder and MP4 use this nominal rate (default 30)",
@@ -136,6 +148,23 @@ pub fn log_pipeline_startup(p: &PipelineParams) {
             "A/V drift watchdog: trim/pad when drift exceeds threshold (~{} + one AAC frame margin); may affect sound quality",
             p.av_drift_threshold_pcm_frames
         );
+    }
+}
+
+fn stream_backpressure_from_env() -> StreamBackpressure {
+    let Ok(raw) = std::env::var("RS_CAPTURE_STREAM_BACKPRESSURE") else {
+        return StreamBackpressure::Block;
+    };
+    let s = raw.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "" | "block" => StreamBackpressure::Block,
+        "drop" | "drop_when_full" | "try" => StreamBackpressure::DropWhenFull,
+        other => {
+            warn!(
+                "RS_CAPTURE_STREAM_BACKPRESSURE={other:?} unknown; use block or drop; using block"
+            );
+            StreamBackpressure::Block
+        }
     }
 }
 

@@ -45,6 +45,23 @@ pub enum VideoCodecPreference {
     PreferSoftware,
 }
 
+/// How the runner pushes into [`OutputTarget::StreamOnly`] / [`OutputTarget::FilesAndStream`] channels.
+///
+/// Use with **bounded** channels from [`stream_pair`]: [`Self::Block`] matches [`crossbeam_channel::Sender::send`]
+/// (wait for capacity); [`Self::DropWhenFull`] matches [`crossbeam_channel::Sender::try_send`] and drops the
+/// outgoing packet if the queue is full (keeps capture from stalling when the consumer is slow).
+///
+/// With **unbounded** channels, [`Self::Block`] never waits for capacity and [`Self::DropWhenFull`] never sees a full queue.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde_config", derive(Serialize, Deserialize))]
+pub enum StreamBackpressure {
+    /// Block the capture thread until the peer receives ([`Sender::send`]).
+    #[default]
+    Block,
+    /// Drop this packet/chunk when the bounded queue is full; see [`crate::params::RunStats`].
+    DropWhenFull,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde_config", derive(Serialize, Deserialize))]
 pub enum AudioCodecChoice {
@@ -68,6 +85,8 @@ pub struct SessionConfig {
     /// `0` = drift watchdog off (recommended).
     pub av_drift_threshold_pcm_frames: u64,
     pub video_preference: VideoCodecPreference,
+    /// Used when [`OutputTarget`] includes stream senders; ignored for file-only output.
+    pub stream_backpressure: StreamBackpressure,
     pub audio_codec: AudioCodecChoice,
     pub limit_frames: Option<u32>,
     pub capture_system_audio: bool,
@@ -87,6 +106,7 @@ impl SessionConfig {
             cfr_mux: false,
             av_drift_threshold_pcm_frames: 0,
             video_preference: VideoCodecPreference::Auto,
+            stream_backpressure: StreamBackpressure::default(),
             audio_codec: AudioCodecChoice::AacLcMf,
             limit_frames: None,
             capture_system_audio: true,
@@ -104,6 +124,7 @@ impl SessionConfig {
             cfr_mux: false,
             av_drift_threshold_pcm_frames: 0,
             video_preference: VideoCodecPreference::Auto,
+            stream_backpressure: StreamBackpressure::default(),
             audio_codec: AudioCodecChoice::AacLcMf,
             limit_frames: None,
             capture_system_audio: true,
@@ -129,6 +150,7 @@ impl SessionConfig {
             cfr_mux: false,
             av_drift_threshold_pcm_frames: 0,
             video_preference: VideoCodecPreference::Auto,
+            stream_backpressure: StreamBackpressure::default(),
             audio_codec: AudioCodecChoice::AacLcMf,
             limit_frames: None,
             capture_system_audio: true,
@@ -136,7 +158,10 @@ impl SessionConfig {
     }
 }
 
-/// Create bounded channels for streaming; returns `(config_fragment_senders, video_rx, audio_rx)`.
+/// Create bounded channels for streaming; returns `(video_tx, audio_tx, video_rx, audio_rx)`.
+///
+/// Capacity applies per queue; combine with [`SessionConfig::stream_backpressure`] / [`crate::params::PipelineParams::stream_backpressure`]:
+/// [`StreamBackpressure::Block`] waits when full; [`StreamBackpressure::DropWhenFull`] drops with bounded queues.
 ///
 /// Build [`SessionConfig`] with [`SessionConfig::with_stream_endpoints`] using the senders, or
 /// attach senders to [`OutputTarget::FilesAndStream`].

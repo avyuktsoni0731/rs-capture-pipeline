@@ -19,7 +19,8 @@ use pipeline::{
     TexturePool,
 };
 use audio_encoder::MfAacLcEncoder;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender, TrySendError};
+use crate::config::StreamBackpressure;
 use crate::events::{AudioChunk, VideoPacket};
 use crate::params::{PipelineParams, RunStats};
 use tracing::{debug, info, warn};
@@ -27,6 +28,49 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamPushOutcome {
+    Delivered,
+    DroppedFull,
+    Disconnected,
+}
+
+fn stream_push_video(
+    tx: &Sender<VideoPacket>,
+    packet: VideoPacket,
+    policy: StreamBackpressure,
+) -> StreamPushOutcome {
+    match policy {
+        StreamBackpressure::Block => match tx.send(packet) {
+            Ok(()) => StreamPushOutcome::Delivered,
+            Err(_) => StreamPushOutcome::Disconnected,
+        },
+        StreamBackpressure::DropWhenFull => match tx.try_send(packet) {
+            Ok(()) => StreamPushOutcome::Delivered,
+            Err(TrySendError::Full(_)) => StreamPushOutcome::DroppedFull,
+            Err(TrySendError::Disconnected(_)) => StreamPushOutcome::Disconnected,
+        },
+    }
+}
+
+fn stream_push_audio(
+    tx: &Sender<AudioChunk>,
+    chunk: AudioChunk,
+    policy: StreamBackpressure,
+) -> StreamPushOutcome {
+    match policy {
+        StreamBackpressure::Block => match tx.send(chunk) {
+            Ok(()) => StreamPushOutcome::Delivered,
+            Err(_) => StreamPushOutcome::Disconnected,
+        },
+        StreamBackpressure::DropWhenFull => match tx.try_send(chunk) {
+            Ok(()) => StreamPushOutcome::Delivered,
+            Err(TrySendError::Full(_)) => StreamPushOutcome::DroppedFull,
+            Err(TrySendError::Disconnected(_)) => StreamPushOutcome::Disconnected,
+        },
+    }
+}
 
 enum AudioMsg {
     Ready {
@@ -84,6 +128,9 @@ pub(crate) fn run_file_recording(
 
     let mut stream_video_packets_sent: u64 = 0;
     let mut stream_audio_chunks_sent: u64 = 0;
+    let mut stream_video_packets_dropped_full: u64 = 0;
+    let mut stream_audio_chunks_dropped_full: u64 = 0;
+    let stream_bp = params.stream_backpressure;
 
     info!("Creating D3D11 device…");
     let D3d11Context { device, context } = create_d3d11_device()?;
@@ -491,8 +538,12 @@ pub(crate) fn run_file_recording(
                             timestamp_us: pkt.timestamp_us,
                             is_keyframe: key,
                         };
-                        if vtx.send(vp).is_ok() {
-                            stream_video_packets_sent += 1;
+                        match stream_push_video(vtx, vp, stream_bp) {
+                            StreamPushOutcome::Delivered => stream_video_packets_sent += 1,
+                            StreamPushOutcome::DroppedFull => {
+                                stream_video_packets_dropped_full += 1;
+                            }
+                            StreamPushOutcome::Disconnected => {}
                         }
                     }
                     muxed_video_duration_ts =
@@ -557,8 +608,14 @@ pub(crate) fn run_file_recording(
                                                 timestamp_us: ts_audio_us,
                                                 payload: au.clone(),
                                             };
-                                            if atx.send(chunk_a).is_ok() {
-                                                stream_audio_chunks_sent += 1;
+                                            match stream_push_audio(atx, chunk_a, stream_bp) {
+                                                StreamPushOutcome::Delivered => {
+                                                    stream_audio_chunks_sent += 1;
+                                                }
+                                                StreamPushOutcome::DroppedFull => {
+                                                    stream_audio_chunks_dropped_full += 1;
+                                                }
+                                                StreamPushOutcome::Disconnected => {}
                                             }
                                         }
                                     }
@@ -681,8 +738,14 @@ pub(crate) fn run_file_recording(
                                     timestamp_us: ts_audio_us,
                                     payload: au.clone(),
                                 };
-                                if atx.send(chunk_a).is_ok() {
-                                    stream_audio_chunks_sent += 1;
+                                match stream_push_audio(atx, chunk_a, stream_bp) {
+                                    StreamPushOutcome::Delivered => {
+                                        stream_audio_chunks_sent += 1;
+                                    }
+                                    StreamPushOutcome::DroppedFull => {
+                                        stream_audio_chunks_dropped_full += 1;
+                                    }
+                                    StreamPushOutcome::Disconnected => {}
                                 }
                             }
                         }
@@ -729,8 +792,12 @@ pub(crate) fn run_file_recording(
                     timestamp_us: ts_audio_us,
                     payload: au.clone(),
                 };
-                if atx.send(chunk_a).is_ok() {
-                    stream_audio_chunks_sent += 1;
+                match stream_push_audio(atx, chunk_a, stream_bp) {
+                    StreamPushOutcome::Delivered => stream_audio_chunks_sent += 1,
+                    StreamPushOutcome::DroppedFull => {
+                        stream_audio_chunks_dropped_full += 1;
+                    }
+                    StreamPushOutcome::Disconnected => {}
                 }
             }
         }
@@ -774,18 +841,22 @@ pub(crate) fn run_file_recording(
         None => "(no files)".to_string(),
     };
     info!(
-        "Done — {}, frames={}, audio_samples={}, stream_video_packets={}, stream_audio_chunks={}",
+        "Done — {}, frames={}, audio_samples={}, stream_video_packets={}, stream_audio_chunks={}, stream_video_dropped_full={}, stream_audio_dropped_full={}",
         done_files,
         saved,
         audio_samples_total,
         stream_video_packets_sent,
-        stream_audio_chunks_sent
+        stream_audio_chunks_sent,
+        stream_video_packets_dropped_full,
+        stream_audio_chunks_dropped_full
     );
     Ok(RunStats {
         frames_captured: saved,
         audio_samples_total,
         stream_video_packets_sent,
         stream_audio_chunks_sent,
+        stream_video_packets_dropped_full,
+        stream_audio_chunks_dropped_full,
     })
 }
 

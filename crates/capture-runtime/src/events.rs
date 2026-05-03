@@ -1,4 +1,6 @@
 //! Types crossing the process boundary to **consumers** (file muxer, WebSocket, WebRTC bridge).
+//!
+//! Delivery semantics come from [`crate::StreamBackpressure`] on [`crate::PipelineParams`] when using stream outputs.
 
 /// Monotonic clock for correlating video and audio (microseconds from capture start / first frame).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]

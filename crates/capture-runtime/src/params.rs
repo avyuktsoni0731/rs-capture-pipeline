@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use crossbeam_channel::Sender;
 
-use crate::config::{AudioCodecChoice, OutputTarget, SessionConfig, VideoCodecPreference};
+use crate::config::{
+    AudioCodecChoice, OutputTarget, SessionConfig, StreamBackpressure, VideoCodecPreference,
+};
 
 #[cfg(windows)]
 use encoder::WindowsEncoderPreference;
@@ -77,15 +79,21 @@ pub struct PipelineParams {
     pub av_drift_threshold_pcm_frames: u64,
     /// Encoder selection (NVENC vs OpenH264); maps to `encoder::WindowsEncoderPreference` at runtime.
     pub video_codec_preference: VideoCodecPreference,
+    /// When outputs include a stream, controls blocking vs drop-on-full (bounded queues).
+    pub stream_backpressure: StreamBackpressure,
     pub remux_with_ffmpeg: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct RunStats {
     pub frames_captured: u32,
     pub audio_samples_total: u64,
     pub stream_video_packets_sent: u64,
     pub stream_audio_chunks_sent: u64,
+    /// Incremented when [`StreamBackpressure::DropWhenFull`] skips a video packet because the queue was full.
+    pub stream_video_packets_dropped_full: u64,
+    /// Incremented when [`StreamBackpressure::DropWhenFull`] skips an audio chunk because the queue was full.
+    pub stream_audio_chunks_dropped_full: u64,
 }
 
 impl PipelineParams {
@@ -148,6 +156,7 @@ impl PipelineParams {
             cfr_mux: session.cfr_mux,
             av_drift_threshold_pcm_frames: session.av_drift_threshold_pcm_frames,
             video_codec_preference,
+            stream_backpressure: session.stream_backpressure,
             remux_with_ffmpeg,
         })
     }
@@ -193,6 +202,17 @@ mod tests {
         assert_eq!(
             p.video_codec_preference,
             crate::config::VideoCodecPreference::PreferSoftware
+        );
+    }
+
+    #[test]
+    fn stream_backpressure_round_trips_from_session() {
+        let mut s = SessionConfig::files_only("x");
+        s.stream_backpressure = crate::config::StreamBackpressure::DropWhenFull;
+        let p = PipelineParams::try_from_session_config(s, false).expect("ok");
+        assert_eq!(
+            p.stream_backpressure,
+            crate::config::StreamBackpressure::DropWhenFull
         );
     }
 }
