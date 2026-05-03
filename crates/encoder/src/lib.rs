@@ -17,8 +17,9 @@ use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 /// - `RS_CAPTURE_ENCODER=openh264` — force software encoding only.
 /// - `RS_CAPTURE_NVENC=0` — skip NVENC (same effect as OpenH264-only for the video path).
 ///
-/// If NVENC initializes but the first `encode_picture` fails on your stack, the app can swap to
-/// OpenH264 automatically (see `capture-pipeline-app` main loop).
+/// When NVENC is used, the app registers the internal BGRA D3D texture (OBS-style) instead of
+/// host I420. If `encode_bgra_texture` / registration fails, the app can swap to OpenH264
+/// automatically (see `capture-pipeline-app` main loop).
 pub fn create_best_encoder(
     device: Option<&ID3D11Device>,
     config: &EncoderConfig,

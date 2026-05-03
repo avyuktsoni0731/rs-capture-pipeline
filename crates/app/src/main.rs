@@ -170,8 +170,10 @@ fn main() -> anyhow::Result<()> {
                         .with_context(|| format!("TexturePool {}x{}", size.width, size.height))?;
                     pool_and_size = Some((pool, size));
 
-                    // NVENC must use the same ID3D11Device as capture; initializing it before the
-                    // first staging readback has caused DXGI device_removed on some stacks.
+                    let enc_cfg_boot =
+                        encoder::EncoderConfig::new(size.width, size.height, FPS, 8_000_000);
+                    video_enc = Some(encoder::create_best_encoder(Some(&device), &enc_cfg_boot)?);
+
                     let path = format!("{out_dir}/clip.h264");
                     h264_out = Some(
                         std::fs::File::create(&path)
@@ -188,37 +190,39 @@ fn main() -> anyhow::Result<()> {
                         .with_context(|| format!("create {mp4_path}"))?,
                     );
                     info!(
-                        "GPU NV12 pool at {}x{} → {} (Annex-B) + {} (MP4 avc1); video encoder starts after first readback",
+                        "GPU NV12 pool at {}x{} → {} (Annex-B) + {} (MP4 avc1); encoder selected at startup (NVENC uses GPU BGRA when available)",
                         size.width, size.height, path, mp4_path
                     );
                 }
 
                 let (pool, size) = pool_and_size.as_ref().unwrap();
-                let targets = pool.acquire().expect("pool empty");
-                converter
-                    .convert(&context, &device, &tex, &targets.y, &targets.uv)
-                    .context("BgraToNv12Converter::convert")?;
-                unsafe {
-                    context.Flush();
-                }
-
-                let (_yw, _yh, y_bytes) =
-                    copy_r8_texture_to_bytes(&device, &context, &targets.y)?;
-                let (_uvw, _uvh, uv_bytes) =
-                    copy_rg8_uint_texture_to_bytes(&device, &context, &targets.uv)?;
-
-                let i420 = encoder::nv12_readback_to_i420(
-                    &y_bytes,
-                    &uv_bytes,
-                    size.width,
-                    size.height,
-                )
-                    .context("nv12_readback_to_i420")?;
-
                 let enc_cfg =
                     encoder::EncoderConfig::new(size.width, size.height, FPS, 8_000_000);
-                if video_enc.is_none() {
-                    video_enc = Some(encoder::create_best_encoder(Some(&device), &enc_cfg)?);
+
+                let use_gpu_nvenc = video_enc
+                    .as_ref()
+                    .expect("encoder initialized with pool")
+                    .supports_bgra_gpu_encode();
+
+                let mut targets_opt = None;
+                if use_gpu_nvenc {
+                    converter
+                        .convert(&context, &device, &tex, None)
+                        .context("BgraToNv12Converter::convert")?;
+                } else {
+                    let targets = pool.acquire().expect("pool empty");
+                    converter
+                        .convert(
+                            &context,
+                            &device,
+                            &tex,
+                            Some((&targets.y, &targets.uv)),
+                        )
+                        .context("BgraToNv12Converter::convert")?;
+                    targets_opt = Some(targets);
+                }
+                unsafe {
+                    context.Flush();
                 }
 
                 let wall_now = Instant::now();
@@ -293,31 +297,83 @@ fn main() -> anyhow::Result<()> {
                     .map(|s| !s.eq_ignore_ascii_case("openh264"))
                     .unwrap_or(true);
 
-                let pkt = match video_enc.as_mut().unwrap().encode_i420(&i420, ts_us) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let msg = format!("{e:#}");
-                        if allow_nvenc_runtime_fallback
-                            && !nvenc_swapped_to_openh264
-                            && (msg.contains("InvalidDevice")
-                                || msg.contains("encode_picture")
-                                || msg.contains("Device passed to the API"))
-                        {
-                            warn!(
-                                "NVENC encode failed ({msg}); switching to OpenH264 for the rest of this run. \
-                                 To skip NVENC up front: RS_CAPTURE_NVENC=0 or RS_CAPTURE_ENCODER=openh264"
-                            );
-                            video_enc = Some(encoder::openh264_encoder_from_config(&enc_cfg)?);
-                            nvenc_swapped_to_openh264 = true;
-                            video_enc
-                                .as_mut()
-                                .unwrap()
-                                .encode_i420(&i420, ts_us)
-                                .context("encode_i420 (OpenH264 after NVENC failure)")?
-                        } else {
-                            return Err(e).context("encode_i420");
+                let pkt = if use_gpu_nvenc {
+                    let bgra = converter
+                        .bgra_copy_texture()
+                        .context("internal BGRA copy texture for NVENC")?;
+                    match video_enc
+                        .as_mut()
+                        .unwrap()
+                        .encode_bgra_texture(bgra, ts_us)
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            if allow_nvenc_runtime_fallback
+                                && !nvenc_swapped_to_openh264
+                                && (msg.contains("InvalidDevice")
+                                    || msg.contains("encode_picture")
+                                    || msg.contains("Device passed to the API")
+                                    || msg.contains("register_resource"))
+                            {
+                                warn!(
+                                    "NVENC GPU encode failed ({msg}); switching to OpenH264 for the rest of this run. \
+                                     To skip NVENC up front: RS_CAPTURE_NVENC=0 or RS_CAPTURE_ENCODER=openh264"
+                                );
+                                let targets = pool.acquire().expect("pool empty");
+                                converter
+                                    .convert(
+                                        &context,
+                                        &device,
+                                        &tex,
+                                        Some((&targets.y, &targets.uv)),
+                                    )
+                                    .context("BgraToNv12Converter::convert (fallback)")?;
+                                unsafe {
+                                    context.Flush();
+                                }
+                                let (_yw, _yh, y_bytes) =
+                                    copy_r8_texture_to_bytes(&device, &context, &targets.y)?;
+                                let (_uvw, _uvh, uv_bytes) =
+                                    copy_rg8_uint_texture_to_bytes(&device, &context, &targets.uv)?;
+                                let i420 = encoder::nv12_readback_to_i420(
+                                    &y_bytes,
+                                    &uv_bytes,
+                                    size.width,
+                                    size.height,
+                                )
+                                .context("nv12_readback_to_i420 (fallback)")?;
+                                pool.release(targets);
+                                video_enc = Some(encoder::openh264_encoder_from_config(&enc_cfg)?);
+                                nvenc_swapped_to_openh264 = true;
+                                video_enc
+                                    .as_mut()
+                                    .unwrap()
+                                    .encode_i420(&i420, ts_us)
+                                    .context("encode_i420 (OpenH264 after NVENC failure)")?
+                            } else {
+                                return Err(e).context("encode_bgra_texture");
+                            }
                         }
                     }
+                } else {
+                    let targets = targets_opt.as_ref().context("NV12 pool targets")?;
+                    let (_yw, _yh, y_bytes) =
+                        copy_r8_texture_to_bytes(&device, &context, &targets.y)?;
+                    let (_uvw, _uvh, uv_bytes) =
+                        copy_rg8_uint_texture_to_bytes(&device, &context, &targets.uv)?;
+                    let i420 = encoder::nv12_readback_to_i420(
+                        &y_bytes,
+                        &uv_bytes,
+                        size.width,
+                        size.height,
+                    )
+                    .context("nv12_readback_to_i420")?;
+                    video_enc
+                        .as_mut()
+                        .unwrap()
+                        .encode_i420(&i420, ts_us)
+                        .context("encode_i420")?
                 };
                 h264_out
                     .as_mut()
@@ -392,7 +448,9 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                pool.release(targets);
+                if let Some(targets) = targets_opt {
+                    pool.release(targets);
+                }
 
                 saved += 1;
                 if saved % 300 == 0 {

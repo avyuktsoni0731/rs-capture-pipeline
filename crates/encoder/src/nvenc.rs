@@ -76,7 +76,6 @@ impl Drop for NvencInner {
 /// we use custom [`Drop`] on [`NvencInner`] for ordering.
 pub struct NvencVideoEncoder {
     width: u32,
-    height: u32,
     frame_idx: usize,
     gop_frames: u32,
     /// COM identity of the texture last passed to `register_resource_dx11` (invalidates registration when it changes).
@@ -150,7 +149,6 @@ impl NvencVideoEncoder {
 
         Ok(Self {
             width,
-            height,
             frame_idx: 0,
             gop_frames,
             registered_tex: None,

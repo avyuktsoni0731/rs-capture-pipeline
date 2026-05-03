@@ -39,9 +39,9 @@ impl BgraToNv12Converter {
         self.bgra_copy.as_ref()
     }
 
-    fn ensure_bgra_srv(&mut self, device: &ID3D11Device) -> anyhow::Result<&ID3D11ShaderResourceView> {
+    fn ensure_bgra_srv(&mut self, device: &ID3D11Device) -> anyhow::Result<()> {
         if self.bgra_srv.is_some() {
-            return Ok(self.bgra_srv.as_ref().unwrap());
+            return Ok(());
         }
         let bgra_copy = self
             .bgra_copy
@@ -69,7 +69,7 @@ impl BgraToNv12Converter {
                 .context("CreateShaderResourceView BGRA (on internal copy)")?;
         }
         self.bgra_srv = Some(srv.context("SRV null")?);
-        Ok(self.bgra_srv.as_ref().unwrap())
+        Ok(())
     }
 
     pub fn new(device: &ID3D11Device) -> anyhow::Result<Self> {
@@ -143,12 +143,13 @@ impl BgraToNv12Converter {
             context.CopyResource(bgra_copy, bgra);
         }
 
-        if out_nv12.is_none() {
-            return Ok(());
-        }
-        let (out_y, out_uv) = out_nv12.expect("checked");
+        let (out_y, out_uv) = match out_nv12 {
+            None => return Ok(()),
+            Some(p) => p,
+        };
 
-        let srv = self.ensure_bgra_srv(device)?;
+        self.ensure_bgra_srv(device)?;
+        let srv = self.bgra_srv.as_ref().unwrap().clone();
 
         let y_key = out_y.as_raw() as usize;
         let uv_key = out_uv.as_raw() as usize;
