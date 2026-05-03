@@ -1,6 +1,9 @@
 //! Audio capture abstractions (WASAPI/mic implementations to be added).
+mod downmix;
 mod wasapi;
 mod wav;
+
+pub use downmix::downmix_interleaved_f32_to_stereo;
 
 /// Interleaved PCM audio chunk.
 #[derive(Clone, Debug)]

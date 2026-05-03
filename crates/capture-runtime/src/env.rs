@@ -109,7 +109,9 @@ pub fn log_pipeline_startup(p: &PipelineParams) {
     }
     match p.audio_codec {
         AudioCodecChoice::AacLcMf => {
-            info!("Audio codec: AAC-LC (MF); set RS_CAPTURE_AUDIO_CODEC=opus for Opus (WebRTC-style)");
+            info!(
+                "Audio codec: AAC-LC (MF); default 192000 bps — RS_CAPTURE_AAC_BITRATE; RS_CAPTURE_AUDIO_CODEC=opus for Opus"
+            );
         }
         AudioCodecChoice::Opus => {
             info!("Audio codec: Opus @ 48 kHz — clip.mp4 is video-only when writing files; Opus packets on stream");

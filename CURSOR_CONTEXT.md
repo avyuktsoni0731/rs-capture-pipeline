@@ -143,10 +143,11 @@ Documented in code: **`crates/capture-runtime/src/env.rs`** and encoder **`regis
 ## Pitfalls (aligned with this codebase)
 
 1. **MF / OpenH264 paths** use **readback → I420**; do not assume zero-copy CPU video for those backends.
-2. **WGC** frame pools have limited slots — keep capture/completion tight (see capture crate usage in `run_win.rs`).
-3. **NVENC** path uses **BGRA texture registration** when async encode is enabled — distinct from I420 MF encode.
-4. **COM** must be initialized on threads that use MF/WASAPI (CLI initializes MTA on main thread; audio thread also calls `CoInitializeEx`).
-5. **Annex-B vs length-prefixed**: MF HW encoder normalizes for downstream; know what your muxer expects (`output` helpers exist).
+2. **WASAPI mix format** may report **more than 2 channels** (e.g. 8 on spatial/enhanced endpoints). MF AAC-LC and Opus only accept mono/stereo — the runner **downmixes** surround layouts to stereo before encode (`audio::downmix_interleaved_f32_to_stereo`).
+3. **WGC** frame pools have limited slots — keep capture/completion tight (see capture crate usage in `run_win.rs`).
+4. **NVENC** path uses **BGRA texture registration** when async encode is enabled — distinct from I420 MF encode.
+5. **COM** must be initialized on threads that use MF/WASAPI (CLI initializes MTA on main thread; audio thread also calls `CoInitializeEx`).
+6. **Annex-B vs length-prefixed**: MF HW encoder normalizes for downstream; know what your muxer expects (`output` helpers exist).
 
 ---
 
