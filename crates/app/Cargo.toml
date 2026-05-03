@@ -9,13 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-crossbeam-channel.workspace = true
-capture = { path = "../capture" }
-pipeline = { path = "../pipeline" }
-encoder = { path = "../encoder" }
-output = { path = "../output" }
-audio = { path = "../audio" }
-audio_encoder = { path = "../audio_encoder" }
+capture-runtime = { path = "../capture-runtime" }
 windows.workspace = true
 ctrlc = "3"
 tracing.workspace = true
