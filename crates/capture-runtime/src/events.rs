@@ -33,4 +33,10 @@ pub enum AudioChunk {
         timestamp_us: u64,
         payload: Vec<u8>,
     },
+    /// Opus packet (RFC 6716), 48 kHz decode timeline; 20 ms frames (960 samples/channel) from our encoder.
+    OpusPacket {
+        channels: u16,
+        timestamp_us: u64,
+        payload: Vec<u8>,
+    },
 }

@@ -1,8 +1,10 @@
 //! Audio encoder abstractions (AAC/Opus implementations plug in here).
 
 mod mf_aac;
+mod opus;
 
 pub use mf_aac::MfAacLcEncoder;
+pub use opus::{OpusEncoder, OPUS_SAMPLES_PER_CHANNEL_FRAME_48K};
 
 use audio::PcmChunk;
 

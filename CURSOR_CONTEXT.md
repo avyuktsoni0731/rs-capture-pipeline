@@ -95,7 +95,7 @@ Embedders should pass an explicit **`WindowsEncoderPreference`** via **`create_w
 - **`PipelineParams`** / **`RecordingOutputs`** / **`RunStats`** — **`params.rs`**
 - **`pipeline_params_from_cli_and_env`**, **`pipeline_params_stream_only`**, etc. — **`env.rs`** (`RS_CAPTURE_*`: fps, bitrate, frame pacing, async NVENC, CFR remux, stream backpressure, video codec preference, …)
 - **`PipelineParams::try_from_session_config`** maps session + env overrides (software force / require NVENC) into resolved params; on Windows, **`windows_encoder_preference()`** maps **`VideoCodecPreference`** → **`encoder::WindowsEncoderPreference`**
-- **`run_file_recording` / `run_recording`** — **`run_win.rs`** (Windows): WGC, optional NVENC async encode thread, MF/OpenH264 I420 path, WASAPI loopback, MF AAC, disk + optional bounded stream channels with block vs drop policy
+- **`run_file_recording` / `run_recording`** — **`run_win.rs`** (Windows): WGC, optional NVENC async encode thread, MF/OpenH264 I420 path, WASAPI loopback, MF AAC-LC **or** Opus (`SessionConfig.audio_codec` / `RS_CAPTURE_AUDIO_CODEC`), disk + optional bounded stream channels with block vs drop policy (Opus: MP4 video-only; packets on stream as **`AudioChunk::OpusPacket`**)
 
 ---
 
@@ -134,6 +134,8 @@ Documented in code: **`crates/capture-runtime/src/env.rs`** and encoder **`regis
 | `RS_CAPTURE_FPS`, `RS_CAPTURE_VIDEO_BITRATE` | Defaults for CLI/env pipeline |
 | `RS_CAPTURE_STREAM_BACKPRESSURE` | `block` vs `drop` for bounded stream queues |
 | `RS_CAPTURE_ASYNC_ENCODE` | Async NVENC encode path |
+| `RS_CAPTURE_AUDIO_CODEC` | `aac` (default) or `opus` — sets `PipelineParams.audio_codec` from CLI env |
+| `RS_CAPTURE_OPUS_BITRATE` | Opus bits/sec (default 128000) |
 | `RS_CAPTURE_NO_PRIORITY_BOOST=1` | Skip raising process priority (CLI) |
 
 ---

@@ -82,6 +82,8 @@ pub struct PipelineParams {
     /// When outputs include a stream, controls blocking vs drop-on-full (bounded queues).
     pub stream_backpressure: StreamBackpressure,
     pub remux_with_ffmpeg: bool,
+    /// Audio encode for loopback: AAC in MP4, or Opus for WebRTC-style streams.
+    pub audio_codec: AudioCodecChoice,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -103,18 +105,16 @@ impl PipelineParams {
     /// - [`VideoCodecPreference::RequireNvenc`] maps to encoder-only NVENC (no OpenH264 fallback at init or mid-run).
     /// - `RS_CAPTURE_ENCODER=openh264` / `RS_CAPTURE_NVENC=0` still force software even if the session requests GPU (matches legacy `create_best_encoder` env behavior).
     /// - `RS_CAPTURE_NVENC_REQUIRED=1` forces [`VideoCodecPreference::RequireNvenc`] unless software is forced.
-    /// - [`AudioCodecChoice::AacLcMf`] is required today; other audio modes return an error until implemented.
+    /// - [`AudioCodecChoice::Opus`] encodes 48 kHz Opus (44.1 kHz loopback is resampled); MP4 remains video-only; stream sends [`crate::events::AudioChunk::OpusPacket`].
+    /// - [`AudioCodecChoice::PcmOnly`] is not supported for this runner yet.
     pub fn try_from_session_config(
         session: SessionConfig,
         remux_with_ffmpeg: bool,
     ) -> anyhow::Result<Self> {
         match session.audio_codec {
-            AudioCodecChoice::AacLcMf => {}
-            AudioCodecChoice::Opus => {
-                anyhow::bail!("SessionConfig.audio_codec Opus is not wired to the recording pipeline yet")
-            }
+            AudioCodecChoice::AacLcMf | AudioCodecChoice::Opus => {}
             AudioCodecChoice::PcmOnly => {
-                anyhow::bail!("SessionConfig.audio_codec PcmOnly is not supported for MP4/AAC recording")
+                anyhow::bail!("SessionConfig.audio_codec PcmOnly is not supported for the Windows runner yet")
             }
         }
 
@@ -168,6 +168,7 @@ impl PipelineParams {
             video_codec_preference,
             stream_backpressure: session.stream_backpressure,
             remux_with_ffmpeg,
+            audio_codec: session.audio_codec,
         })
     }
 
@@ -203,6 +204,15 @@ mod tests {
         assert_eq!(p.fps, 60);
         assert_eq!(p.frame_limit, 100);
         assert_eq!(p.video_codec_preference, crate::config::VideoCodecPreference::Auto);
+        assert_eq!(p.audio_codec, crate::config::AudioCodecChoice::AacLcMf);
+    }
+
+    #[test]
+    fn session_opus_maps_to_pipeline() {
+        let mut s = SessionConfig::files_only("out");
+        s.audio_codec = crate::config::AudioCodecChoice::Opus;
+        let p = PipelineParams::try_from_session_config(s, false).expect("ok");
+        assert_eq!(p.audio_codec, crate::config::AudioCodecChoice::Opus);
     }
 
     #[test]

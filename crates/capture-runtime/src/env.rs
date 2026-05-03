@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use tracing::{info, warn};
 
-use crate::config::{StreamBackpressure, VideoCodecPreference};
+use crate::config::{AudioCodecChoice, StreamBackpressure, VideoCodecPreference};
 use crate::params::{PipelineParams, RecordingOutputs};
 
 /// Build [`PipelineParams`] from CLI arguments plus `RS_CAPTURE_*` env overrides (file output only).
@@ -36,6 +36,7 @@ fn build_pipeline_params(
     let video_codec_preference = video_codec_preference_from_env();
     let stream_backpressure = stream_backpressure_from_env();
     let remux_with_ffmpeg = std::env::var("RS_CAPTURE_FFMPEG_MUX").ok().as_deref() == Some("1");
+    let audio_codec = audio_codec_choice_from_env();
 
     PipelineParams {
         outputs,
@@ -50,6 +51,7 @@ fn build_pipeline_params(
         video_codec_preference,
         stream_backpressure,
         remux_with_ffmpeg,
+        audio_codec,
     }
 }
 
@@ -105,6 +107,17 @@ pub fn log_pipeline_startup(p: &PipelineParams) {
             );
         }
     }
+    match p.audio_codec {
+        AudioCodecChoice::AacLcMf => {
+            info!("Audio codec: AAC-LC (MF); set RS_CAPTURE_AUDIO_CODEC=opus for Opus (WebRTC-style)");
+        }
+        AudioCodecChoice::Opus => {
+            info!("Audio codec: Opus @ 48 kHz — clip.mp4 is video-only when writing files; Opus packets on stream");
+        }
+        AudioCodecChoice::PcmOnly => {
+            info!("Audio codec: PcmOnly (session only; runner does not support yet)");
+        }
+    }
     if p.outputs.stream_senders().is_some() {
         match p.stream_backpressure {
             StreamBackpressure::Block => {
@@ -145,9 +158,17 @@ pub fn log_pipeline_startup(p: &PipelineParams) {
         info!("A/V drift watchdog off (default; audio timeline follows video ts_us). Set RS_CAPTURE_AV_DRIFT_SAMPLES to enable trim/pad");
     } else {
         info!(
-            "A/V drift watchdog: trim/pad when drift exceeds threshold (~{} + one AAC frame margin); may affect sound quality",
+            "A/V drift watchdog: trim/pad when drift exceeds threshold (~{} + one encoded audio frame margin); may affect sound quality",
             p.av_drift_threshold_pcm_frames
         );
+    }
+}
+
+fn audio_codec_choice_from_env() -> AudioCodecChoice {
+    match std::env::var("RS_CAPTURE_AUDIO_CODEC").ok().as_deref() {
+        Some(s) if s.eq_ignore_ascii_case("opus") => AudioCodecChoice::Opus,
+        Some(s) if s.eq_ignore_ascii_case("aac") => AudioCodecChoice::AacLcMf,
+        _ => AudioCodecChoice::AacLcMf,
     }
 }
 

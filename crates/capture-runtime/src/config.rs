@@ -73,7 +73,7 @@ pub enum AudioCodecChoice {
     #[default]
     /// AAC-LC via Media Foundation for MP4 (today’s path).
     AacLcMf,
-    /// Reserved for WebRTC / low latency (Phase 2).
+    /// Opus (RFC 6716) at 48 kHz — for WebRTC-style streaming; MP4 file mux stays video-only until extended.
     Opus,
     PcmOnly,
 }

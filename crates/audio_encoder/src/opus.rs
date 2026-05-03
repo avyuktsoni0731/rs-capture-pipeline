@@ -1,6 +1,5 @@
 //! Opus encoder (libopus via `audiopus`): 48 kHz, 20 ms frames (960 samples/channel).
 
-use anyhow::Context;
 use audiopus::coder::Encoder;
 use audiopus::{Application, Bitrate, Channels, SampleRate};
 
@@ -52,6 +51,7 @@ pub struct OpusEncoder {
     pending: Vec<f32>,
     channels: usize,
     frame_samples_per_channel: usize,
+    input_sample_rate: u32,
 }
 
 impl OpusEncoder {
@@ -65,7 +65,7 @@ impl OpusEncoder {
         let ch_n = channels as usize;
         let mut enc = Encoder::new(SampleRate::Hz48000, ch, Application::Audio)
             .map_err(|e| anyhow::anyhow!("opus Encoder::new: {e}"))?;
-        enc.set_bitrate(Bitrate::Bits(bitrate_bps as i32))
+        enc.set_bitrate(Bitrate::BitsPerSecond(bitrate_bps as i32))
             .map_err(|e| anyhow::anyhow!("opus set_bitrate: {e}"))?;
 
         Ok(Self {
@@ -73,34 +73,37 @@ impl OpusEncoder {
             pending: Vec::new(),
             channels: ch_n,
             frame_samples_per_channel: OPUS_SAMPLES_PER_CHANNEL_FRAME_48K as usize,
+            input_sample_rate,
         })
     }
 
-    /// Resample to 48 kHz if needed, buffer, return one Opus packet per 20 ms (typ. 1 per call after enough input).
+    /// WASAPI-rate PCM → 48 kHz internally; buffers until a 20 ms frame is complete.
     pub fn push_interleaved_f32(&mut self, interleaved: &[f32]) -> anyhow::Result<Vec<Vec<u8>>> {
         if interleaved.is_empty() {
             return Ok(Vec::new());
         }
-        // Caller passes native-rate PCM; we only support 44.1k/48k and convert to 48k here.
-        // (Rate is fixed per session from WASAPI Ready — run_win stores it.)
-        self.pending.extend_from_slice(interleaved);
+        let at_48k = match self.input_sample_rate {
+            48_000 => interleaved.to_vec(),
+            44_100 => resample_interleaved_linear(self.channels, 44_100, 48_000, interleaved),
+            _ => anyhow::bail!("OpusEncoder: unsupported input_sample_rate {}", self.input_sample_rate),
+        };
+        self.pending.extend(at_48k);
         self.drain_frames()
     }
 
-    /// Pad with silence to a full frame and return any final packets.
+    /// Pad with silence to whole frames and drain.
     pub fn flush(&mut self) -> anyhow::Result<Vec<Vec<u8>>> {
         let need = self
             .frame_samples_per_channel
             .saturating_mul(self.channels);
-        if !self.pending.is_empty() && self.pending.len() < need {
-            self.pending.resize(need, 0.0);
+        if self.pending.is_empty() {
+            return Ok(Vec::new());
         }
-        let mut out = self.drain_frames()?;
-        if !self.pending.is_empty() {
-            // One more frame of silence if odd remainder
-            self.pending.clear();
+        let r = self.pending.len() % need;
+        if r != 0 {
+            self.pending.resize(self.pending.len() + (need - r), 0.0);
         }
-        Ok(out)
+        self.drain_frames()
     }
 
     fn drain_frames(&mut self) -> anyhow::Result<Vec<Vec<u8>>> {
@@ -119,22 +122,6 @@ impl OpusEncoder {
         }
         Ok(packets)
     }
-}
-
-/// Resample a single WASAPI chunk to 48 kHz interleaved `f32` for Opus.
-pub fn resample_to_48k_for_opus(
-    wasapi_rate: u32,
-    channels: u16,
-    interleaved: &[f32],
-) -> anyhow::Result<Vec<f32>> {
-    let ch = channels as usize;
-    if wasapi_rate == 48_000 {
-        return Ok(interleaved.to_vec());
-    }
-    if wasapi_rate == 44_100 {
-        return Ok(resample_interleaved_linear(ch, 44_100, 48_000, interleaved));
-    }
-    anyhow::bail!("Opus: unexpected WASAPI rate {wasapi_rate}")
 }
 
 #[cfg(test)]
