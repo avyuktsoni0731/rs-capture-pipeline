@@ -19,6 +19,7 @@ use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 /// Uses [`WindowsEncoderPreference::from_env`] (same rules as before):
 /// - `RS_CAPTURE_ENCODER=openh264` — force software encoding only.
 /// - `RS_CAPTURE_NVENC=0` — skip NVENC (same effect as OpenH264-only for the video path).
+/// - `RS_CAPTURE_NVENC_REQUIRED=1` — NVENC only (no OpenH264 fallback at init).
 ///
 /// Embeddable hosts should call [`create_windows_encoder`] with an explicit [`WindowsEncoderPreference`]
 /// so settings do not depend on process environment.
@@ -45,6 +46,23 @@ pub fn create_encoder_with_preference(
     if matches!(preference, SoftwareOnly) {
         tracing::info!("Windows encoder: OpenH264 only (software-only preference)");
         return openh264_encoder_from_config(config);
+    }
+
+    if matches!(preference, RequireNvenc) {
+        let dev = device.ok_or_else(|| {
+            anyhow::anyhow!("RequireNvenc: no D3D11 device (NVENC-only mode)")
+        })?;
+        let enc = nvenc::NvencVideoEncoder::try_new(dev, config).map_err(|e| {
+            anyhow::anyhow!("RequireNvenc: NVENC init failed (no OpenH264 fallback): {e:#}")
+        })?;
+        tracing::info!(
+            "Using NVENC H.264 (required) at {}x{} @ {} fps, {} bps",
+            config.width,
+            config.height,
+            config.fps,
+            config.bitrate_bps
+        );
+        return Ok(Box::new(enc));
     }
 
     if let Some(dev) = device {
@@ -89,4 +107,25 @@ pub fn openh264_encoder_from_config(config: &EncoderConfig) -> anyhow::Result<Bo
         config.height,
         config.bitrate_bps,
     )?))
+}
+
+#[cfg(test)]
+mod preference_tests {
+    use super::*;
+    use crate::registry::WindowsEncoderPreference;
+
+    #[test]
+    fn require_nvenc_without_device_errors() {
+        let cfg = EncoderConfig::new(640, 480, 30, 1_000_000);
+        match create_encoder_with_preference(None, &cfg, WindowsEncoderPreference::RequireNvenc) {
+            Ok(_) => panic!("expected RequireNvenc without device to fail"),
+            Err(e) => {
+                let s = format!("{e:#}");
+                assert!(
+                    s.contains("D3D11") || s.contains("NVENC"),
+                    "unexpected error: {s}"
+                );
+            }
+        }
+    }
 }

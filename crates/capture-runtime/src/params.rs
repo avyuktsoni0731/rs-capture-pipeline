@@ -100,7 +100,9 @@ impl PipelineParams {
     /// Build runner params from a [`SessionConfig`] (e.g. serialized host settings).
     ///
     /// - [`VideoCodecPreference::PreferSoftware`] skips NVENC (OpenH264 only).
+    /// - [`VideoCodecPreference::RequireNvenc`] maps to encoder-only NVENC (no OpenH264 fallback at init or mid-run).
     /// - `RS_CAPTURE_ENCODER=openh264` / `RS_CAPTURE_NVENC=0` still force software even if the session requests GPU (matches legacy `create_best_encoder` env behavior).
+    /// - `RS_CAPTURE_NVENC_REQUIRED=1` forces [`VideoCodecPreference::RequireNvenc`] unless software is forced.
     /// - [`AudioCodecChoice::AacLcMf`] is required today; other audio modes return an error until implemented.
     pub fn try_from_session_config(
         session: SessionConfig,
@@ -139,8 +141,16 @@ impl PipelineParams {
             || std::env::var("RS_CAPTURE_NVENC")
                 .map(|s| s == "0" || s.eq_ignore_ascii_case("off"))
                 .unwrap_or(false);
+        let env_requires_nvenc = std::env::var("RS_CAPTURE_NVENC_REQUIRED")
+            .map(|s| {
+                let t = s.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false);
         let video_codec_preference = if env_forces_software {
             VideoCodecPreference::PreferSoftware
+        } else if env_requires_nvenc {
+            VideoCodecPreference::RequireNvenc
         } else {
             session.video_preference
         };
@@ -167,6 +177,7 @@ impl PipelineParams {
         match self.video_codec_preference {
             VideoCodecPreference::Auto => WindowsEncoderPreference::Auto,
             VideoCodecPreference::PreferNvenc => WindowsEncoderPreference::PreferNvenc,
+            VideoCodecPreference::RequireNvenc => WindowsEncoderPreference::RequireNvenc,
             VideoCodecPreference::PreferSoftware => WindowsEncoderPreference::SoftwareOnly,
         }
     }
@@ -213,6 +224,22 @@ mod tests {
         assert_eq!(
             p.stream_backpressure,
             crate::config::StreamBackpressure::DropWhenFull
+        );
+    }
+
+    #[test]
+    fn require_nvenc_round_trips_from_session() {
+        let mut s = SessionConfig::files_only("x");
+        s.video_preference = crate::config::VideoCodecPreference::RequireNvenc;
+        let p = PipelineParams::try_from_session_config(s, false).expect("ok");
+        assert_eq!(
+            p.video_codec_preference,
+            crate::config::VideoCodecPreference::RequireNvenc
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            p.windows_encoder_preference(),
+            encoder::WindowsEncoderPreference::RequireNvenc
         );
     }
 }

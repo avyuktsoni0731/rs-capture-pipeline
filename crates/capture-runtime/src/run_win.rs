@@ -390,8 +390,11 @@ pub(crate) fn run_file_recording(
                     .as_micros()
                     .min(u128::from(u64::MAX)) as u64;
 
-                let allow_nvenc_runtime_fallback =
-                    !matches!(params.video_codec_preference, crate::config::VideoCodecPreference::PreferSoftware);
+                let allow_nvenc_runtime_fallback = matches!(
+                    params.video_codec_preference,
+                    crate::config::VideoCodecPreference::Auto
+                        | crate::config::VideoCodecPreference::PreferNvenc
+                );
 
                 let sync_nvenc = video_enc
                     .as_ref()

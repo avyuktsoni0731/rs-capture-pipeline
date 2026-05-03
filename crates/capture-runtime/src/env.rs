@@ -176,7 +176,16 @@ fn video_codec_preference_from_env() -> VideoCodecPreference {
         .map(|s| s == "0" || s.eq_ignore_ascii_case("off"))
         .unwrap_or(false);
     if force_sw || skip_nvenc {
-        VideoCodecPreference::PreferSoftware
+        return VideoCodecPreference::PreferSoftware;
+    }
+    let require_nvenc = std::env::var("RS_CAPTURE_NVENC_REQUIRED")
+        .map(|s| {
+            let t = s.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false);
+    if require_nvenc {
+        VideoCodecPreference::RequireNvenc
     } else {
         VideoCodecPreference::Auto
     }

@@ -19,6 +19,8 @@ pub enum WindowsEncoderPreference {
     Auto,
     /// Same NVENC→OpenH264 order as [`Self::Auto`]; reserved for future tuning (bitrate, AMF priority).
     PreferNvenc,
+    /// NVENC only: [`crate::create_encoder_with_preference`] returns an error if NVENC cannot be opened.
+    RequireNvenc,
     /// OpenH264 only (no NVENC attempt).
     SoftwareOnly,
 }
@@ -34,6 +36,14 @@ impl WindowsEncoderPreference {
             .unwrap_or(false);
         if force_sw || skip_nvenc {
             Self::SoftwareOnly
+        } else if std::env::var("RS_CAPTURE_NVENC_REQUIRED")
+            .map(|s| {
+                let t = s.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false)
+        {
+            Self::RequireNvenc
         } else {
             Self::Auto
         }

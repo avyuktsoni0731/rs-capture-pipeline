@@ -35,13 +35,18 @@ pub enum OutputTarget {
     },
 }
 
-/// Hint for encoder selection order once multiple backends exist (`encoder` crate).
+/// Windows H.264 encoder selection; the runner maps this to the `encoder` crate ([`crate::params::PipelineParams`] on Windows).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde_config", derive(Serialize, Deserialize))]
 pub enum VideoCodecPreference {
+    /// Try NVENC first; fall back to OpenH264 if NVENC init fails or at runtime on recoverable GPU errors.
     #[default]
     Auto,
+    /// Prefer NVENC when multiple GPU encoders exist (ordering hook); **same fallback behavior as [`Self::Auto`] today**.
     PreferNvenc,
+    /// NVENC only: session fails at encoder init if NVENC is unavailable, and the runner does **not** swap to OpenH264 mid-capture.
+    RequireNvenc,
+    /// OpenH264 only (no NVENC).
     PreferSoftware,
 }
 
