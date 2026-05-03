@@ -1,5 +1,5 @@
 //! WGC capture + OpenH264 + WASAPI: H.264 + AAC in `clip.mp4` (Media Foundation), WAV debug, optional ffmpeg remux.
-//! Optional: `RS_CAPTURE_CFR=1` (fixed-duration video samples), `RS_CAPTURE_AV_DRIFT_SAMPLES` (A/V trim/pad).
+//! Optional: `RS_CAPTURE_CFR=1` (fixed-duration video samples), `RS_CAPTURE_AV_DRIFT_SAMPLES` (A/V trim/pad; off by default).
 
 mod encode_async;
 
@@ -106,13 +106,14 @@ fn cfr_mux_from_env() -> bool {
     }
 }
 
-/// Whole PCM frames (per-channel timeline) before correcting A/V drift. `0` disables the watchdog.
-/// Default **480** (~10 ms at 48 kHz). Set `RS_CAPTURE_AV_DRIFT_SAMPLES=0` to turn off.
+/// Whole PCM frames (per-channel timeline) before correcting A/V drift. **`0` disables** (default).
+/// Sync is already driven by encoder `ts_us`; enabling this can insert silence/trim and cause artifacts
+/// unless large thresholds are used. Set e.g. `RS_CAPTURE_AV_DRIFT_SAMPLES=4096` to re-enable padding.
 fn av_drift_threshold_frames_from_env() -> u64 {
     match std::env::var("RS_CAPTURE_AV_DRIFT_SAMPLES") {
-        Ok(s) if s.trim().is_empty() => 480,
-        Ok(s) => s.parse::<u64>().unwrap_or(480),
-        Err(_) => 480,
+        Ok(s) if s.trim().is_empty() => 0,
+        Ok(s) => s.parse::<u64>().unwrap_or(0),
+        Err(_) => 0,
     }
 }
 
@@ -220,10 +221,10 @@ fn main() -> anyhow::Result<()> {
         info!("RS_CAPTURE_CFR=1: MP4 video uses fixed sample duration with duplicate frames for gaps");
     }
     if av_drift_threshold_frames == 0 {
-        info!("RS_CAPTURE_AV_DRIFT_SAMPLES=0: A/V drift watchdog disabled");
+        info!("A/V drift watchdog off (default; audio timeline follows video ts_us). Set RS_CAPTURE_AV_DRIFT_SAMPLES to enable trim/pad");
     } else {
         info!(
-            "A/V drift watchdog: trim/pad when muxed audio vs video differs by > {} PCM frames (RS_CAPTURE_AV_DRIFT_SAMPLES=0 to disable)",
+            "A/V drift watchdog: trim/pad when drift exceeds threshold (~{} + one AAC frame margin); may affect sound quality",
             av_drift_threshold_frames
         );
     }
@@ -610,15 +611,21 @@ fn main() -> anyhow::Result<()> {
                     while let Ok(msg) = rx.try_recv() {
                         match msg {
                             AudioMsg::Chunk(mut chunk) => {
-                                trim_interleaved_f32_frames_front(
+                                let trimmed = trim_interleaved_f32_frames_front(
                                     &mut chunk.samples_f32,
                                     audio_pcm_channels,
                                     &mut pending_audio_frame_skip,
                                 );
-                                prepend_silence_pcm_frames_front(
+                                let prepended = prepend_silence_pcm_frames_front(
                                     &mut chunk.samples_f32,
                                     audio_pcm_channels,
                                     &mut pending_silence_pcm_frames,
+                                );
+                                smooth_pcm_chunk_edges(
+                                    &mut chunk.samples_f32,
+                                    audio_pcm_channels,
+                                    prepended,
+                                    trimmed,
                                 );
                                 if chunk.samples_f32.is_empty() {
                                     continue;
@@ -709,15 +716,21 @@ fn main() -> anyhow::Result<()> {
             for msg in rx.try_iter() {
                 match msg {
                     AudioMsg::Chunk(mut chunk) => {
-                        trim_interleaved_f32_frames_front(
+                        let trimmed = trim_interleaved_f32_frames_front(
                             &mut chunk.samples_f32,
                             audio_pcm_channels,
                             &mut pending_audio_frame_skip,
                         );
-                        prepend_silence_pcm_frames_front(
+                        let prepended = prepend_silence_pcm_frames_front(
                             &mut chunk.samples_f32,
                             audio_pcm_channels,
                             &mut pending_silence_pcm_frames,
+                        );
+                        smooth_pcm_chunk_edges(
+                            &mut chunk.samples_f32,
+                            audio_pcm_channels,
+                            prepended,
+                            trimmed,
                         );
                         if chunk.samples_f32.is_empty() {
                             continue;
@@ -830,14 +843,15 @@ fn try_mux_with_ffmpeg(video_mp4: &str, audio_wav: &str, output_mp4: &str) -> an
 }
 
 /// Pad interleaved PCM with leading silence (`pending_frames` whole PCM frames across channels).
+/// Returns how many **whole** PCM frames were prepended (for edge smoothing).
 fn prepend_silence_pcm_frames_front(
     samples: &mut Vec<f32>,
     channels: u16,
     pending_frames: &mut u64,
-) {
+) -> u64 {
     let ch = channels as usize;
     if *pending_frames == 0 || ch == 0 {
-        return;
+        return 0;
     }
     let take = (*pending_frames as usize).min(48_000);
     let mut prefix = vec![0.0f32; take * ch];
@@ -848,6 +862,54 @@ fn prepend_silence_pcm_frames_front(
         *samples = prefix;
     }
     *pending_frames -= take as u64;
+    take as u64
+}
+
+/// Linear fade so hard boundaries (silence insert, time-skip trim) do not click or hiss in AAC.
+/// ~1 ms at 48 kHz.
+const PCM_EDGE_FADE_FRAMES: usize = 48;
+
+fn smooth_pcm_chunk_edges(
+    samples: &mut [f32],
+    channels: u16,
+    prepended_frames: u64,
+    trimmed_frames: u64,
+) {
+    let ch = channels as usize;
+    if ch == 0 || samples.is_empty() {
+        return;
+    }
+    if prepended_frames > 0 {
+        let ps = (prepended_frames as usize).saturating_mul(ch);
+        if ps >= samples.len() {
+            return;
+        }
+        let n_frames = (samples.len() - ps) / ch;
+        let fade = PCM_EDGE_FADE_FRAMES.min(n_frames).max(1);
+        for fi in 0..fade {
+            let g = (fi + 1) as f32 / fade as f32;
+            let base = ps + fi * ch;
+            for c in 0..ch {
+                let i = base + c;
+                if i < samples.len() {
+                    samples[i] *= g;
+                }
+            }
+        }
+    } else if trimmed_frames > 0 {
+        let n_frames = samples.len() / ch;
+        let fade = PCM_EDGE_FADE_FRAMES.min(n_frames).max(1);
+        for fi in 0..fade {
+            let g = (fi + 1) as f32 / fade as f32;
+            let base = fi * ch;
+            for c in 0..ch {
+                let i = base + c;
+                if i < samples.len() {
+                    samples[i] *= g;
+                }
+            }
+        }
+    }
 }
 
 /// Keeps muxed AAC timeline aligned with muxed video duration (round-trip remainder vs AAC framing).
@@ -867,10 +929,13 @@ fn reconcile_mux_av_drift(
     }
     let want = (muxed_video_duration_ts as u128 * sample_rate as u128 / v_ts as u128) as u64;
     let delta = want as i128 - muxed_audio_samples as i128;
-    if delta > threshold as i128 {
+    // AAC advances mux in 1024-sample steps; comparing to a smooth `want` curve causes tiny
+    // oscillating pad/trim ("static") unless we require a margin past one LC frame.
+    let margin = threshold.saturating_add(1024) as i128;
+    if delta > margin {
         let add = (delta as u64).min(DRIFT_CORRECT_MAX_STEP);
         *pending_silence_pcm_frames = pending_silence_pcm_frames.saturating_add(add);
-    } else if delta < -(threshold as i128) {
+    } else if delta < -margin {
         let trim = ((-delta) as u64).min(DRIFT_CORRECT_MAX_STEP);
         *pending_audio_frame_skip = pending_audio_frame_skip.saturating_add(trim);
     }
@@ -892,10 +957,10 @@ fn trim_interleaved_f32_frames_front(
     samples: &mut Vec<f32>,
     channels: u16,
     skip_frames: &mut u64,
-) {
+) -> u64 {
     let ch = channels as usize;
     if ch == 0 || samples.is_empty() || *skip_frames == 0 {
-        return;
+        return 0;
     }
     let frame_count = samples.len() / ch;
     let take = (*skip_frames as usize).min(frame_count);
@@ -903,4 +968,5 @@ fn trim_interleaved_f32_frames_front(
         samples.drain(0..take * ch);
         *skip_frames = skip_frames.saturating_sub(take as u64);
     }
+    take as u64
 }
