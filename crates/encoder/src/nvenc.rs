@@ -82,9 +82,8 @@ struct NvencInner {
 
 impl Drop for NvencInner {
     fn drop(&mut self) {
-        let enc: &nvenc::encoder::Encoder = &self.encoder;
-        let bs: &BitStream = &self.bitstream;
-        let _ = enc.flush_eos(bs);
+        // Clear DX registration before tearing down encoder/bitstream. Older nvenc crate revisions
+        // exposed `flush_eos`; current `nvenc` `Encoder` drops without an explicit EOS flush here.
         self.registered = None;
         unsafe {
             ManuallyDrop::drop(&mut self.bitstream);
@@ -135,6 +134,13 @@ impl NvencVideoEncoder {
         let (preset_guid, preset_label) = pick_h264_preset(&codecs, &preset_list)?;
 
         let tuning = tuning_info_from_env();
+        let tuning_label = match &tuning {
+            NVencTuningInfo::HighQuality => "HighQuality",
+            NVencTuningInfo::LowLatency => "LowLatency",
+            NVencTuningInfo::UltraLowLatency => "UltraLowLatency",
+            NVencTuningInfo::UltraHighQuality => "UltraHighQuality",
+            _ => "other",
+        };
 
         let (session, mut preset_config) = session
             .get_encode_preset_config_ex(
@@ -157,14 +163,6 @@ impl NvencVideoEncoder {
         // `NeedMoreInput` with no output until more frames are fed — that broke the app and
         // triggered an OpenH264 fallback (catastrophic for 1080p60).
         preset_config.preset_cfg.rc_params.look_ahead_depth = 0;
-
-        let tuning_label = match tuning {
-            NVencTuningInfo::HighQuality => "HighQuality",
-            NVencTuningInfo::LowLatency => "LowLatency",
-            NVencTuningInfo::UltraLowLatency => "UltraLowLatency",
-            NVencTuningInfo::UltraHighQuality => "UltraHighQuality",
-            _ => "other",
-        };
         tracing::info!(
             "NVENC encode: preset {} (best of P7→P2 on this GPU), tuning {tuning_label} (RS_CAPTURE_NVENC_TUNING), {} bps VBR",
             preset_label,
@@ -178,7 +176,7 @@ impl NvencVideoEncoder {
             resolution: [width, height],
             aspect_ratio: dar,
             frame_rate: [config.fps.max(1), 1],
-            tuning_info: tuning,
+            tuning_info: tuning_info_from_env(),
             buffer_format: NVencBufferFormat::ARGB,
             encode_config: &mut preset_config.preset_cfg,
             enable_ptd: true,
