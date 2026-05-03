@@ -216,8 +216,9 @@ fn main() -> anyhow::Result<()> {
     let mut saved: u32 = 0;
     // Wall-clock origin for encoder timestamps (set on first encoded frame).
     let mut video_t0: Option<Instant> = None;
-    // Previous frame wall time for variable MP4 sample durations.
-    let mut last_frame_wall: Option<Instant> = None;
+    // Previous frame cumulative timestamp (µs since video_t0); drives MP4 sample durations so they
+    // match the encoder PTS and stay aligned with the audio (sample-count) timeline.
+    let mut last_ts_us: u64 = 0;
 
     let mut pool_and_size: Option<(TexturePool, FrameSize)> = None;
     let mut nvenc_async: Option<encode_async::NvencAsync> = None;
@@ -533,27 +534,18 @@ fn main() -> anyhow::Result<()> {
                 let duration_ts = if saved == 0 {
                     nominal
                 } else {
-                    let prev = last_frame_wall.context("last_frame_wall after first frame")?;
-                    let delta = wall_now.saturating_duration_since(prev);
-                    wall_duration_to_ts_units(delta, v_ts)
-                        .min(max_dur)
-                        .max(1)
+                    let delta_us = ts_us.saturating_sub(last_ts_us);
+                    duration_ts_from_delta_us(delta_us, v_ts, max_dur)
                 };
-                last_frame_wall = Some(wall_now);
+                last_ts_us = ts_us;
 
                 mp4.write_annex_b_frame_with_duration(&pkt.data, pkt.is_keyframe, duration_ts)
                     .context("write clip.mp4")?;
 
                 if let Some(rx) = audio_rx.as_ref() {
-                    if !audio_frame_skip_bootstrapped {
-                        if let Some(t0) = video_t0.as_ref() {
-                            if audio_sample_rate > 0 {
-                                let elapsed = Instant::now().saturating_duration_since(*t0);
-                                pending_audio_frame_skip =
-                                    wall_duration_to_pcm_frames(elapsed, audio_sample_rate);
-                                audio_frame_skip_bootstrapped = true;
-                            }
-                        }
+                    if !audio_frame_skip_bootstrapped && audio_sample_rate > 0 {
+                        pending_audio_frame_skip = ts_us_to_pcm_frames(ts_us, audio_sample_rate);
+                        audio_frame_skip_bootstrapped = true;
                     }
                     while let Ok(msg) = rx.try_recv() {
                         match msg {
@@ -735,20 +727,16 @@ fn try_mux_with_ffmpeg(video_mp4: &str, audio_wav: &str, output_mp4: &str) -> an
     }
 }
 
-fn wall_duration_to_ts_units(d: Duration, timescale_hz: u32) -> u32 {
-    let micros = d.as_micros().min(u128::from(u64::MAX)) as u64;
-    let v = micros
-        .saturating_mul(u64::from(timescale_hz))
-        .saturating_div(1_000_000);
-    u32::try_from(v).unwrap_or(u32::MAX).max(1)
+fn duration_ts_from_delta_us(delta_us: u64, timescale_hz: u32, max_dur: u32) -> u32 {
+    let v =
+        (delta_us as u128 * u128::from(timescale_hz) + 500_000) / 1_000_000;
+    let capped = v.min(u128::from(max_dur)).max(1);
+    u32::try_from(capped).unwrap_or(max_dur)
 }
 
-/// Whole PCM frames (one time slot across all channels) to drop for a wall-clock duration.
-fn wall_duration_to_pcm_frames(d: Duration, sample_rate: u32) -> u64 {
-    let nanos = d.as_nanos().min(u128::from(u64::MAX) as u128);
-    (nanos
-        .saturating_mul(u128::from(sample_rate))
-        / 1_000_000_000) as u64
+/// Whole PCM frames (one time slot across all channels) to skip so muxed audio aligns with `ts_us`.
+fn ts_us_to_pcm_frames(ts_us: u64, sample_rate: u32) -> u64 {
+    (ts_us as u128 * u128::from(sample_rate) / 1_000_000) as u64
 }
 
 fn trim_interleaved_f32_frames_front(
