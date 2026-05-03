@@ -1,7 +1,8 @@
-//! Intel **Quick Sync Video** hook: DXGI probe + encoder factory slot (NVENC → **QSV** → OpenH264).
+//! Intel **Quick Sync Video** path: DXGI probe + Media Foundation **hardware** H.264 MFT
+//! (NVENC → **MF HW H.264 on Intel** → OpenH264).
 //!
-//! Full H.264 encode via oneVPL / D3D11 is not wired yet; [`try_create_qsv_encoder`] is the
-//! extension point. [`intel_adapter_present`] is cheap and safe to call for UI or telemetry.
+//! [`intel_adapter_present`] is for telemetry/UI only; selection always tries MF hardware after NVENC.
+//! [`try_create_qsv_encoder`] wraps `MfH264HwEncoder` (NV12-in / Annex-B out).
 
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
@@ -30,18 +31,15 @@ pub fn intel_adapter_present() -> bool {
     false
 }
 
-/// Try to open an Intel QSV-backed H.264 encoder on the capture [`ID3D11Device`].
+/// Try Intel Quick Sync–class encode: **MF hardware H.264** with NV12 input (see [`crate::mf_h264_hw::MfH264HwEncoder`]).
 ///
-/// Today this **always** returns an error (encode path not implemented). The registry still calls
-/// it after NVENC fails when [`intel_adapter_present`] is true so the fallback order and logging
-/// match the final design.
+/// `device` is reserved for a future D3D11 device-manager path; today encoding uses system-memory NV12.
 pub(crate) fn try_create_qsv_encoder(
     _device: &ID3D11Device,
-    _config: &EncoderConfig,
+    config: &EncoderConfig,
 ) -> anyhow::Result<Box<dyn VideoEncoder>> {
-    anyhow::bail!(
-        "Intel QSV H.264 encoder not implemented (oneVPL / D3D11 path pending); use OpenH264 fallback"
-    )
+    let enc = crate::mf_h264_hw::MfH264HwEncoder::try_new(config)?;
+    Ok(Box::new(enc))
 }
 
 #[cfg(test)]
