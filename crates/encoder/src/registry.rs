@@ -1,11 +1,11 @@
 //! Windows encoder **selection order** for [`crate::VideoEncoder`].
 //!
 //! ## Today
-//! **NVENC** (if NVIDIA stack + D3D11 and preference allow) → **OpenH264** (software).
+//! **NVENC** (NVIDIA + D3D11, when allowed) → **Intel QSV slot** (DXGI Intel `VendorId` probe +
+//! `try_create_qsv_encoder` in the `qsv` module; full encode pending) → **OpenH264** (software).
 //!
 //! ## Planned (same selection API)
-//! **AMD AMF (VCE)** and **Intel Quick Sync** will be probed between NVENC and OpenH264 using the
-//! same `EncoderConfig` + `ID3D11Device` surface path where applicable.
+//! **AMD AMF (VCE)** between NVENC and QSV or after QSV — same `EncoderConfig` + surface path.
 
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 

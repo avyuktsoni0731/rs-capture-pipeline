@@ -4,17 +4,20 @@ mod annex_b;
 mod i420;
 mod nvenc;
 mod openh264_enc;
+mod qsv;
 pub mod registry;
 mod traits;
 
 pub use i420::nv12_readback_to_i420;
+pub use qsv::intel_adapter_present;
 pub use registry::{create_windows_encoder, WindowsEncoderPreference};
 pub use openh264_enc::OpenH264VideoEncoder;
 pub use traits::{EncodedPacket, EncoderConfig, VideoCodec, VideoEncoder};
 
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
-/// Prefer NVENC when `device` is provided and the driver stack is available; fall back to OpenH264.
+/// Prefer NVENC when `device` is provided and the driver stack is available; then Intel QSV when an
+/// Intel adapter exists (encode hook pending), then OpenH264.
 ///
 /// Uses [`WindowsEncoderPreference::from_env`] (same rules as before):
 /// - `RS_CAPTURE_ENCODER=openh264` — force software encoding only.
@@ -82,8 +85,29 @@ pub fn create_encoder_with_preference(
                 tracing::warn!(
                     error = %e,
                     prefer_nvenc = prefer,
-                    "NVENC init failed; falling back to OpenH264"
+                    "NVENC init failed; trying Intel QSV slot then OpenH264"
                 );
+            }
+        }
+
+        if qsv::intel_adapter_present() {
+            match qsv::try_create_qsv_encoder(dev, config) {
+                Ok(enc) => {
+                    tracing::info!(
+                        "Using Intel QSV H.264 at {}x{} @ {} fps, {} bps",
+                        config.width,
+                        config.height,
+                        config.fps,
+                        config.bitrate_bps
+                    );
+                    return Ok(enc);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "Intel QSV encoder unavailable; using OpenH264"
+                    );
+                }
             }
         }
     } else if matches!(preference, PreferNvenc) {
