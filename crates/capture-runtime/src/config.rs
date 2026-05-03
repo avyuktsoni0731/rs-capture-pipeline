@@ -109,6 +109,31 @@ impl SessionConfig {
             capture_system_audio: true,
         }
     }
+
+    /// Disk + stream (same defaults as [`Self::files_only`]) for relay/preview while recording.
+    pub fn files_and_stream(
+        directory: impl Into<PathBuf>,
+        video: Sender<VideoPacket>,
+        audio: Sender<AudioChunk>,
+    ) -> Self {
+        Self {
+            output: OutputTarget::FilesAndStream {
+                directory: directory.into(),
+                video,
+                audio,
+            },
+            fps: 30,
+            video_bitrate_bps: 45_000_000,
+            frame_pacing: true,
+            async_nvenc: true,
+            cfr_mux: false,
+            av_drift_threshold_pcm_frames: 0,
+            video_preference: VideoCodecPreference::Auto,
+            audio_codec: AudioCodecChoice::AacLcMf,
+            limit_frames: None,
+            capture_system_audio: true,
+        }
+    }
 }
 
 /// Create bounded channels for streaming; returns `(config_fragment_senders, video_rx, audio_rx)`.

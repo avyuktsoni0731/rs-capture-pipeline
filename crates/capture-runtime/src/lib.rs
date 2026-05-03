@@ -5,8 +5,11 @@
 //! ```ignore
 //! let params = capture_runtime::pipeline_params_from_cli_and_env("capture_out", 0, true);
 //! let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-//! let stats = capture_runtime::run_file_recording(&params, stop)?;
+//! let stats = capture_runtime::run_recording(&params, stop)?;
 //! ```
+//!
+//! Or build from a [`SessionConfig`] (e.g. from JSON with `serde_config`):
+//! `PipelineParams::try_from_session_config(session, /* remux */ false)?`.
 //!
 //! ## Cargo.toml in another repo (path dependency)
 //!
@@ -49,10 +52,29 @@ pub fn run_file_recording(
     run_win::run_file_recording(params, stop)
 }
 
+/// Alias for [`run_file_recording`] (records to files and/or stream sinks).
+#[cfg(windows)]
+#[inline]
+pub fn run_recording(
+    params: &PipelineParams,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<RunStats> {
+    run_file_recording(params, stop)
+}
+
 #[cfg(not(windows))]
 pub fn run_file_recording(
     _params: &PipelineParams,
     _stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<RunStats> {
     anyhow::bail!("capture-runtime file recording is only implemented on Windows")
+}
+
+#[cfg(not(windows))]
+#[inline]
+pub fn run_recording(
+    params: &PipelineParams,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<RunStats> {
+    run_file_recording(params, stop)
 }
