@@ -144,12 +144,14 @@ dependencies = [
  "audio_encoder",
  "capture",
  "crossbeam-channel",
+ "ctrlc",
  "encoder",
  "output",
  "pipeline",
  "serde",
  "thiserror 1.0.69",
  "tracing",
+ "tracing-subscriber",
  "windows",
 ]
 

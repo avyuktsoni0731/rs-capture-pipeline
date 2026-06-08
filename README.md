@@ -41,6 +41,21 @@ cargo run --release -p capture-pipeline-app -- capture_out 300
 
 Logging uses `RUST_LOG` (e.g. `RUST_LOG=info` or `debug`).
 
+## Examples (embedding)
+
+Minimal hosts live on the **`capture-runtime`** crate:
+
+```bash
+# Record to disk (same outputs as the CLI, fewer extras)
+cargo run --example record_to_dir -p capture-runtime -- my_out 300
+
+# Stream-only: print video/audio packet rates (no WebRTC — your app owns transport)
+cargo run --example stream_stats -p capture-runtime -- 300
+RS_CAPTURE_AUDIO_CODEC=opus cargo run --example stream_stats -p capture-runtime -- 300
+```
+
+Full integration guide: **[`docs/INTEGRATION.md`](docs/INTEGRATION.md)**.
+
 ## Output files
 
 When writing to a directory (default CLI path), you typically get:
@@ -80,7 +95,7 @@ capture-runtime = { path = "path/to/rs-capture-pipeline/crates/capture-runtime",
 - For **stream-only** output, use **`capture_runtime::stream_pair`**, attach senders to **`SessionConfig::with_stream_endpoints`**, and consume **`VideoPacket`** / **`AudioChunk`** on the receivers.
 - Initialize **COM** on the thread that uses Media Foundation / WASAPI (see `crates/app/src/main.rs`).
 
-This repository does **not** implement WebICE, RTP, or a full WebRTC stack—only encoded media and timestamps for a host to forward.
+This repository does **not** implement WebRTC, RTP, or a full WebRTC stack—only encoded media and timestamps for a host to forward.
 
 ## Environment variables
 
@@ -105,7 +120,9 @@ Behavior is driven by `RS_CAPTURE_*` variables. The full set is implemented in [
 
 ## Documentation
 
+- **[`docs/INTEGRATION.md`](docs/INTEGRATION.md)** — **start here** when embedding in another app.
 - **[`CURSOR_CONTEXT.md`](CURSOR_CONTEXT.md)** — architecture notes, env overview, and pitfalls for editors/agents.
+- **[`CHANGELOG.md`](CHANGELOG.md)** — API / example changes.
 - Crate-level rustdoc: run `cargo doc -p capture-runtime --open`.
 
 ## License

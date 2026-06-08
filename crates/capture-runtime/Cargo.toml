@@ -24,3 +24,14 @@ windows.workspace = true
 [features]
 default = []
 serde_config = ["dep:serde", "serde/derive"]
+
+[dev-dependencies]
+anyhow.workspace = true
+ctrlc = "3"
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+] }

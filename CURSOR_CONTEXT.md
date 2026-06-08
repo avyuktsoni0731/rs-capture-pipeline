@@ -34,7 +34,9 @@ rs-capture-pipeline/
     └── app/                    # Thin CLI → pipeline_params_from_cli_and_env + run_file_recording
 ```
 
-There is **no** top-level `docs/` or `tests/` tree in this repo today; tests live beside crates (`#[cfg(test)]` and unit modules).
+- **`docs/INTEGRATION.md`** — embedder guide (COM, stream API, examples).
+- **`CHANGELOG.md`** — `capture-runtime` API notes.
+- Tests live beside crates (`#[cfg(test)]` and unit modules); **`capture-runtime/examples/`** hosts `record_to_dir` and `stream_stats`.
 
 ---
 
