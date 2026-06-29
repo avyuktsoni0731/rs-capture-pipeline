@@ -1,7 +1,5 @@
 //! Windows file recording implementation (`PipelineParams` → disk + optional ffmpeg remux).
 
-mod process_metrics;
-
 use std::io::Write;
 use std::process::Command;
 use std::sync::{
@@ -311,7 +309,7 @@ pub(crate) fn run_file_recording(
                 "Writing process metrics to {} (RS_CAPTURE_METRICS=0 to disable)",
                 dir.join("metrics.csv").display()
             );
-            Some(process_metrics::spawn_metrics_csv_logger(
+            Some(crate::process_metrics::spawn_metrics_csv_logger(
                 dir.to_path_buf(),
                 Arc::clone(&stop),
                 Arc::clone(&frames_for_metrics),

@@ -116,11 +116,13 @@ Behavior is driven by `RS_CAPTURE_*` variables. The full set is implemented in [
 | `RS_CAPTURE_STREAM_BACKPRESSURE` | `block` vs `drop` for bounded stream channels. |
 | `RS_CAPTURE_AV_DRIFT_SAMPLES` | Optional A/V drift trim/pad threshold (0 = off). |
 | `RS_CAPTURE_FFMPEG_MUX` | Set to `1` to mux WAV + MP4 with FFmpeg when installed. |
+| `RS_CAPTURE_METRICS` | Write `{out_dir}/metrics.csv` (process CPU/RAM + FPS); `0` to disable. |
 | `RS_CAPTURE_NO_PRIORITY_BOOST` | Set to `1` to skip raising process priority (CLI). |
 
 ## Documentation
 
 - **[`docs/INTEGRATION.md`](docs/INTEGRATION.md)** — **start here** when embedding in another app.
+- **[`docs/GAME_BENCHMARK.md`](docs/GAME_BENCHMARK.md)** — OBS vs pipeline game benchmark (Afterburner + `metrics.csv`).
 - **[`CURSOR_CONTEXT.md`](CURSOR_CONTEXT.md)** — architecture notes, env overview, and pitfalls for editors/agents.
 - **[`CHANGELOG.md`](CHANGELOG.md)** — API / example changes.
 - Crate-level rustdoc: run `cargo doc -p capture-runtime --open`.

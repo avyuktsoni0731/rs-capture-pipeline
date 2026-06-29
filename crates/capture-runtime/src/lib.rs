@@ -28,6 +28,9 @@ pub mod params;
 pub mod encode_async;
 
 #[cfg(windows)]
+mod process_metrics;
+
+#[cfg(windows)]
 mod run_win;
 
 pub use config::{

@@ -272,7 +272,7 @@ pub fn metrics_csv_enabled() -> bool {
     match std::env::var("RS_CAPTURE_METRICS").ok().as_deref() {
         Some("0") | Some("off") | Some("false") => false,
         Some(_) => true,
-        Err(_) => true,
+        None => true,
     }
 }
 
