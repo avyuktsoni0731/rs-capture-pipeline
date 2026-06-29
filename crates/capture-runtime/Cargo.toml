@@ -11,6 +11,7 @@ crossbeam-channel.workspace = true
 tracing.workspace = true
 serde = { workspace = true, optional = true }
 thiserror.workspace = true
+sysinfo.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 capture = { path = "../capture" }

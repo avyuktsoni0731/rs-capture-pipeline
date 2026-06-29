@@ -1,9 +1,11 @@
 //! Windows file recording implementation (`PipelineParams` → disk + optional ffmpeg remux).
 
+mod process_metrics;
+
 use std::io::Write;
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -21,6 +23,7 @@ use pipeline::{
 use audio_encoder::{MfAacLcEncoder, OpusEncoder};
 use crossbeam_channel::{unbounded, Receiver, Sender, TrySendError};
 use crate::config::{AudioCodecChoice, StreamBackpressure};
+use crate::env::metrics_csv_enabled;
 use crate::events::{AudioChunk, VideoPacket};
 use crate::params::{PipelineParams, RunStats};
 use tracing::{debug, info, warn};
@@ -300,6 +303,25 @@ pub(crate) fn run_file_recording(
         std::fs::create_dir_all(dir)
             .with_context(|| format!("create_dir_all {}", dir.display()))?;
     }
+
+    let frames_for_metrics = Arc::new(AtomicU32::new(0));
+    let metrics_join = if metrics_csv_enabled() {
+        if let Some(dir) = params.outputs.directory() {
+            info!(
+                "Writing process metrics to {} (RS_CAPTURE_METRICS=0 to disable)",
+                dir.join("metrics.csv").display()
+            );
+            Some(process_metrics::spawn_metrics_csv_logger(
+                dir.to_path_buf(),
+                Arc::clone(&stop),
+                Arc::clone(&frames_for_metrics),
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let mut stream_video_packets_sent: u64 = 0;
     let mut stream_audio_chunks_sent: u64 = 0;
@@ -891,6 +913,7 @@ pub(crate) fn run_file_recording(
                 }
 
                 saved += 1;
+                frames_for_metrics.store(saved, Ordering::Relaxed);
 
                 // Pace wall-clock spacing toward nominal FPS so we don't burst-process compositor
                 // frames faster than ~fps/sec (smoother sample spacing vs pure VFR). Cannot invent
@@ -1126,6 +1149,10 @@ pub(crate) fn run_file_recording(
         stream_video_packets_dropped_full,
         stream_audio_chunks_dropped_full
     );
+    stop.store(true, Ordering::SeqCst);
+    if let Some(join) = metrics_join {
+        let _ = join.join();
+    }
     Ok(RunStats {
         frames_captured: saved,
         audio_samples_total,
