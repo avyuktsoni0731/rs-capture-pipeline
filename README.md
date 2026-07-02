@@ -1,132 +1,170 @@
 # rs-capture-pipeline
 
-Windows screen and system-audio capture with hardware-friendly H.264 encoding, optional AAC or Opus, and MP4/H.264 output. Ships as a **library** (`capture-runtime`) for embedding in CLIs, tray apps, or native publishers, plus a small reference binary.
+Windows-first screen + system-audio capture in Rust with hardware-friendly H.264 encoding, optional AAC/Opus audio, and embeddable streaming outputs.
+
+This project is built around `capture-runtime`: a library you integrate into your own app (collab tool, recorder, streamer, native sender), plus a small reference CLI for local testing.
+
+## Why this exists
+
+If you're building a product, you often need a capture module rather than a full broadcaster app:
+
+- Reliable Windows display capture (`WGC`)
+- System audio capture (`WASAPI` loopback)
+- Encoder fallback strategy (`NVENC` -> software)
+- Files and/or encoded packet output you can route into your transport layer
+
+This repo focuses on that layer. It does not include WebRTC signaling/transport logic.
+
+## Demo and benchmark
+
+- Full write-up (Forza benchmark vs OBS): [building a rust capture pipeline - benchmarking it against obs in forza](https://www.avyuktsoni.com/writing/rust-capture-pipeline-forza-benchmark-vs-obs)
+- Comparison video (OBS vs pipeline): [YouTube demo](https://www.youtube.com/watch?v=JqCID-oWQjc)
+
+## Media placeholders (add your screenshots)
+
+```md
+![Forza benchmark summary](docs/media/forza-benchmark-summary.png)
+![Architecture diagram](docs/media/architecture-diagram.png)
+![OBS vs pipeline side-by-side](docs/media/obs-vs-pipeline-side-by-side.png)
+```
+
+## Architecture at a glance
+
+1. Capture display frames with Windows Graphics Capture
+2. Capture system audio with WASAPI loopback
+3. Convert frames into encoder-friendly formats (NV12/I420)
+4. Encode video (NVENC preferred, software fallback)
+5. Encode audio (AAC or Opus)
+6. Output to disk and/or stream channels (`VideoPacket`, `AudioChunk`)
 
 ## Features
 
-- **Video:** Windows Graphics Capture (WGC), D3D11 path, **NVENC** (prefer) with **OpenH264** fallback, optional async encode queue.
-- **Audio:** WASAPI loopback; multichannel mixes **downmixed to stereo** for AAC/Opus; tunable fold-down and optional presence emphasis.
-- **Mux:** Progressive MP4 with H.264 + AAC-LC (Media Foundation), raw `clip.h264`, WAV (`audio.wav`). A/V timeline aligned to encoder PTS when muxing.
-- **Streaming:** Optional `crossbeam_channel` sinks emit **`VideoPacket`** (Annex-B H.264) and **`AudioChunk`** (AAC access units or Opus payloads) for hosts that bridge to WebRTC, RTMP, etc.
+- **Video path:** WGC + D3D11 texture flow, `NVENC` preferred with software fallback.
+- **Audio path:** WASAPI loopback, multichannel downmix to stereo, optional presence emphasis.
+- **Muxing/output:** MP4 (`H.264` + AAC when available), `clip.h264`, `audio.wav`.
+- **Streaming-friendly API:** bounded `crossbeam_channel` outputs for host-owned transport stacks.
+- **Runtime controls:** `RS_CAPTURE_*` environment configuration for fps, bitrate, codec, pacing, backpressure, and metrics.
 
-## Requirements
+## Platform and requirements
 
-- **OS:** Windows **64-bit** (capture and runtime are implemented for Windows only today).
-- **Rust:** Toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (currently **1.85**). Use `rustup` so the repo picks it up automatically.
-- **GPU / drivers:** For NVENC, a supported NVIDIA driver and hardware encode capability; otherwise OpenH264 (CPU) is used.
-- **Optional:** [FFmpeg](https://ffmpeg.org/) on `PATH` if you use `RS_CAPTURE_FFMPEG_MUX=1` to build `clip_with_audio.mp4` from `clip.mp4` + `audio.wav`.
+- **OS:** Windows 64-bit (current implementation target)
+- **Rust:** toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml)
+- **GPU:** NVIDIA recommended for `NVENC`; software fallback available
+- **Optional:** [FFmpeg](https://ffmpeg.org/) for post-mux flow via `RS_CAPTURE_FFMPEG_MUX=1`
 
-## Quick start
+## Quick start (CLI)
+
+Build:
 
 ```bash
-cd rs-capture-pipeline
-cargo build --release
+cargo build --release -p capture-pipeline-app
 ```
 
-Run the reference CLI (COM + above-normal priority + Ctrl+C stop):
+Run:
 
 ```bash
 cargo run --release -p capture-pipeline-app -- [OUT_DIR] [FRAME_LIMIT] [noaudio]
 ```
 
-- **`OUT_DIR`** — output directory (default: `capture_out`). Created if missing.
-- **`FRAME_LIMIT`** — stop after this many frames; `0` = until Ctrl+C.
-- **Third arg `noaudio`** — disable system audio capture.
+Arguments:
 
-Example: 10 seconds at 30 fps ≈ 300 frames:
+- `OUT_DIR`: output directory (default `capture_out`)
+- `FRAME_LIMIT`: number of frames, `0` runs until Ctrl+C
+- `noaudio`: optional third argument to disable loopback capture
 
-```bash
-cargo run --release -p capture-pipeline-app -- capture_out 300
+Example (60 fps target, run until stopped):
+
+```powershell
+$env:RS_CAPTURE_FPS="60"
+cargo run --release -p capture-pipeline-app -- capture_out 0
 ```
 
-Logging uses `RUST_LOG` (e.g. `RUST_LOG=info` or `debug`).
+## Expected outputs
 
-## Examples (embedding)
-
-Minimal hosts live on the **`capture-runtime`** crate:
-
-```bash
-# Record to disk (same outputs as the CLI, fewer extras)
-cargo run --example record_to_dir -p capture-runtime -- my_out 300
-
-# Stream-only: print video/audio packet rates (no WebRTC — your app owns transport)
-cargo run --example stream_stats -p capture-runtime -- 300
-RS_CAPTURE_AUDIO_CODEC=opus cargo run --example stream_stats -p capture-runtime -- 300
-```
-
-Full integration guide: **[`docs/INTEGRATION.md`](docs/INTEGRATION.md)**.
-
-## Output files
-
-When writing to a directory (default CLI path), you typically get:
+When recording to files, the directory typically contains:
 
 | File | Description |
 |------|-------------|
-| `clip.h264` | Elementary H.264 (Annex B). |
-| `clip.mp4` | H.264 in MP4; AAC track when MF AAC is available. |
-| `audio.wav` | Float32 stereo (or mono) PCM from the mix that feeds the encoder. |
-| `clip_with_audio.mp4` | Only if `RS_CAPTURE_FFMPEG_MUX=1` and FFmpeg succeeds. |
+| `clip.h264` | Raw H.264 elementary stream (Annex-B) |
+| `clip.mp4` | MP4 video (AAC track when Media Foundation AAC path is active) |
+| `audio.wav` | Float32 PCM capture mix |
+| `metrics.csv` | Process metrics (CPU/RAM/FPS) when `RS_CAPTURE_METRICS != 0` |
+| `clip_with_audio.mp4` | Optional FFmpeg mux output when enabled |
 
-## Workspace layout
+## Use as a library (`capture-runtime`)
 
-| Crate | Role |
-|-------|------|
-| [`crates/capture`](crates/capture) | WGC session, D3D11, frame → texture. |
-| [`crates/pipeline`](crates/pipeline) | BGRA → NV12 / I420, texture pool, staging. |
-| [`crates/encoder`](crates/encoder) | NVENC, OpenH264, encoder registry and Windows preferences. |
-| [`crates/audio`](crates/audio) | WASAPI loopback, WAV writer, downmix, presence emphasis. |
-| [`crates/audio_encoder`](crates/audio_encoder) | MF AAC-LC, Opus (48 kHz; 44.1 kHz resampled in-encoder). |
-| [`crates/output`](crates/output) | MP4 writer (H.264 + optional AAC). |
-| [`crates/capture-runtime`](crates/capture-runtime) | **Public API:** `run_recording`, `SessionConfig`, `PipelineParams`, stream channels. |
-| [`crates/app`](crates/app) | Binary `capture-pipeline` (thin wrapper around `capture-runtime`). |
-| [`vendor/nvenc`](vendor/nvenc) | Patched `nvenc` crate (see root `Cargo.toml` `[patch]`). |
-
-## Using as a library
-
-Add a path dependency to your `Cargo.toml`:
+Add dependency:
 
 ```toml
 [dependencies]
 capture-runtime = { path = "path/to/rs-capture-pipeline/crates/capture-runtime", features = ["serde_config"] }
 ```
 
-- Call **`run_file_recording`** / **`run_recording`** with **`PipelineParams`** and an **`Arc<AtomicBool>`** stop flag.
-- Build params from **`pipeline_params_from_cli_and_env`**, **`SessionConfig`**, or **`PipelineParams::try_from_session_config`**.
-- For **stream-only** output, use **`capture_runtime::stream_pair`**, attach senders to **`SessionConfig::with_stream_endpoints`**, and consume **`VideoPacket`** / **`AudioChunk`** on the receivers.
-- Initialize **COM** on the thread that uses Media Foundation / WASAPI (see `crates/app/src/main.rs`).
+Then:
 
-This repository does **not** implement WebRTC, RTP, or a full WebRTC stack—only encoded media and timestamps for a host to forward.
+- Build `PipelineParams` from env/CLI helpers or `SessionConfig`
+- Call `run_recording` / `run_file_recording` with a stop flag
+- For stream mode, wire `stream_pair` and consume `VideoPacket` / `AudioChunk`
+- Initialize COM (`MTA`) on the thread running capture
 
-## Environment variables
+See full integration details in [`docs/INTEGRATION.md`](docs/INTEGRATION.md).
 
-Behavior is driven by `RS_CAPTURE_*` variables. The full set is implemented in [`crates/capture-runtime/src/env.rs`](crates/capture-runtime/src/env.rs) and encoder selection in [`crates/encoder/src/registry.rs`](crates/encoder/src/registry.rs). Commonly used:
+## Common environment variables
+
+All runtime knobs live under `RS_CAPTURE_*` (implemented in [`crates/capture-runtime/src/env.rs`](crates/capture-runtime/src/env.rs)).
 
 | Variable | Purpose |
 |----------|---------|
-| `RS_CAPTURE_FPS` | Nominal frame rate (1–240, default 30). |
-| `RS_CAPTURE_VIDEO_BITRATE` | Video bitrate in bps. |
-| `RS_CAPTURE_ENCODER` / `RS_CAPTURE_NVENC` / `RS_CAPTURE_NVENC_REQUIRED` | Encoder selection and NVENC policy. |
-| `RS_CAPTURE_ASYNC_ENCODE` | NVENC async worker path. |
-| `RS_CAPTURE_FRAME_PACING` | Sleep to pace compositor polling toward nominal FPS. |
-| `RS_CAPTURE_CFR` | CFR-style MP4 video sample timing. |
-| `RS_CAPTURE_AUDIO_CODEC` | `aac` (default) or `opus` for encoded stream/file behavior. |
-| `RS_CAPTURE_AAC_BITRATE` | AAC bitrate (default 192000). |
-| `RS_CAPTURE_OPUS_BITRATE` | Opus bitrate when Opus is selected. |
-| `RS_CAPTURE_PRESENCE_EMPHASIS` | Stereo mid/vocal tilt (`0` / `off` to disable). |
-| `RS_CAPTURE_STREAM_BACKPRESSURE` | `block` vs `drop` for bounded stream channels. |
-| `RS_CAPTURE_AV_DRIFT_SAMPLES` | Optional A/V drift trim/pad threshold (0 = off). |
-| `RS_CAPTURE_FFMPEG_MUX` | Set to `1` to mux WAV + MP4 with FFmpeg when installed. |
-| `RS_CAPTURE_METRICS` | Write `{out_dir}/metrics.csv` (process CPU/RAM + FPS); `0` to disable. |
-| `RS_CAPTURE_NO_PRIORITY_BOOST` | Set to `1` to skip raising process priority (CLI). |
+| `RS_CAPTURE_FPS` | Nominal target fps (1-240) |
+| `RS_CAPTURE_VIDEO_BITRATE` | Video bitrate in bps |
+| `RS_CAPTURE_AUDIO_CODEC` | `aac` (default) or `opus` |
+| `RS_CAPTURE_AAC_BITRATE` | AAC bitrate (default `192000`) |
+| `RS_CAPTURE_OPUS_BITRATE` | Opus bitrate |
+| `RS_CAPTURE_ENCODER` / `RS_CAPTURE_NVENC` / `RS_CAPTURE_NVENC_REQUIRED` | Video encoder policy |
+| `RS_CAPTURE_ASYNC_ENCODE` | Enable async NVENC queue path |
+| `RS_CAPTURE_FRAME_PACING` | Frame pacing sleep behavior |
+| `RS_CAPTURE_CFR` | CFR-like MP4 sample timing behavior |
+| `RS_CAPTURE_STREAM_BACKPRESSURE` | `block` or `drop` for stream queues |
+| `RS_CAPTURE_PRESENCE_EMPHASIS` | Mid/vocal emphasis in downmix path |
+| `RS_CAPTURE_AV_DRIFT_SAMPLES` | A/V drift trim/pad threshold |
+| `RS_CAPTURE_METRICS` | Write `metrics.csv` (`0` disables) |
+| `RS_CAPTURE_FFMPEG_MUX` | Enable FFmpeg post-mux |
+| `RS_CAPTURE_NO_PRIORITY_BOOST` | Disable priority boost in CLI |
+
+## Repository layout
+
+| Path | Role |
+|------|------|
+| [`crates/capture`](crates/capture) | WGC session and frame acquisition |
+| [`crates/pipeline`](crates/pipeline) | Frame conversion and staging |
+| [`crates/encoder`](crates/encoder) | Video encoder registry and backends |
+| [`crates/audio`](crates/audio) | Loopback capture, downmix, WAV |
+| [`crates/audio_encoder`](crates/audio_encoder) | AAC/Opus encode paths |
+| [`crates/output`](crates/output) | MP4 writing and sample packaging |
+| [`crates/capture-runtime`](crates/capture-runtime) | Public embeddable API |
+| [`crates/app`](crates/app) | Reference binary (`capture-pipeline-app`) |
+| [`vendor/nvenc`](vendor/nvenc) | Patched NVENC crate |
 
 ## Documentation
 
-- **[`docs/INTEGRATION.md`](docs/INTEGRATION.md)** — **start here** when embedding in another app.
-- **[`docs/GAME_BENCHMARK.md`](docs/GAME_BENCHMARK.md)** — OBS vs pipeline game benchmark (Afterburner + `metrics.csv`).
-- **[`CURSOR_CONTEXT.md`](CURSOR_CONTEXT.md)** — architecture notes, env overview, and pitfalls for editors/agents.
-- **[`CHANGELOG.md`](CHANGELOG.md)** — API / example changes.
-- Crate-level rustdoc: run `cargo doc -p capture-runtime --open`.
+- [`docs/INTEGRATION.md`](docs/INTEGRATION.md): embedder-first guide
+- [`docs/GAME_BENCHMARK.md`](docs/GAME_BENCHMARK.md): benchmark workflow (OBS vs pipeline)
+- [`CHANGELOG.md`](CHANGELOG.md): release notes and API changes
+
+Generate rustdoc:
+
+```bash
+cargo doc -p capture-runtime --open
+```
+
+## Current status
+
+This is production-oriented infrastructure software, but still actively evolving:
+
+- Ready for limited Windows testing and integration feedback
+- Known tuning work remains for capture/mux pacing in some 60 fps scenarios
+- Transport remains host-owned by design (WebRTC/RTMP/etc. are out of scope here)
 
 ## License
 
-`capture-runtime` declares `MIT OR Apache-2.0` in its manifest; other crates may follow the same unless noted in their `Cargo.toml`. Confirm per crate before redistribution.
+`capture-runtime` uses `MIT OR Apache-2.0`. Confirm license declarations per crate before redistribution.
