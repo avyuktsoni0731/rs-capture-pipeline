@@ -43,6 +43,7 @@ thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 audiopus = "0.2"
+sysinfo = "0.33"
 
 # Patched `nvenc`: EOS flush with a real bitstream pointer + infallible `Drop` (upstream unwraps on destroy).
 [patch.crates-io]

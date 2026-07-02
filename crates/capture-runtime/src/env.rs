@@ -266,6 +266,16 @@ fn video_bitrate_bps_from_env() -> u32 {
     }
 }
 
+/// Write `{output_dir}/metrics.csv` while recording to disk (process CPU/RAM + capture FPS).
+/// Set `RS_CAPTURE_METRICS=0` to disable.
+pub fn metrics_csv_enabled() -> bool {
+    match std::env::var("RS_CAPTURE_METRICS").ok().as_deref() {
+        Some("0") | Some("off") | Some("false") => false,
+        Some(_) => true,
+        None => true,
+    }
+}
+
 fn frame_pacing_from_env() -> bool {
     match std::env::var("RS_CAPTURE_FRAME_PACING") {
         Ok(s) if s == "0" || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("false") => {
