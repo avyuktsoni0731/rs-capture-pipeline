@@ -20,13 +20,23 @@ This repo focuses on that layer. It does not include WebRTC signaling/transport 
 - Full write-up (Forza benchmark vs OBS): [building a rust capture pipeline - benchmarking it against obs in forza](https://www.avyuktsoni.com/writing/rust-capture-pipeline-forza-benchmark-vs-obs)
 - Comparison video (OBS vs pipeline): [YouTube demo](https://www.youtube.com/watch?v=JqCID-oWQjc)
 
-## Media placeholders (add your screenshots)
+## Media
 
-```md
-![Forza benchmark summary](docs/media/forza-benchmark-summary.png)
-![Architecture diagram](docs/media/architecture-diagram.png)
-![OBS vs pipeline side-by-side](docs/media/obs-vs-pipeline-side-by-side.png)
+![Forza benchmark summary](media/forza-benchmark-summary.png)
+
+```mermaid
+flowchart LR
+    A[Windows Graphics Capture<br/>Display Frames] --> B[Pipeline Convert<br/>BGRA to NV12 or I420]
+    C[WASAPI Loopback<br/>System Audio] --> D[Audio Path<br/>Downmix and Drift Control]
+    B --> E[Video Encoder<br/>NVENC preferred or OpenH264 fallback]
+    D --> F[Audio Encoder<br/>AAC or Opus]
+    E --> G[Output Layer]
+    F --> G
+    G --> H[Files<br/>clip.h264, clip.mp4, audio.wav]
+    G --> I[Stream Channels<br/>VideoPacket and AudioChunk]
 ```
+
+![OBS vs pipeline side-by-side](media/obs-pipeline-comparison.png)
 
 ## Architecture at a glance
 
@@ -83,13 +93,13 @@ cargo run --release -p capture-pipeline-app -- capture_out 0
 
 When recording to files, the directory typically contains:
 
-| File | Description |
-|------|-------------|
-| `clip.h264` | Raw H.264 elementary stream (Annex-B) |
-| `clip.mp4` | MP4 video (AAC track when Media Foundation AAC path is active) |
-| `audio.wav` | Float32 PCM capture mix |
-| `metrics.csv` | Process metrics (CPU/RAM/FPS) when `RS_CAPTURE_METRICS != 0` |
-| `clip_with_audio.mp4` | Optional FFmpeg mux output when enabled |
+| File                  | Description                                                    |
+| --------------------- | -------------------------------------------------------------- |
+| `clip.h264`           | Raw H.264 elementary stream (Annex-B)                          |
+| `clip.mp4`            | MP4 video (AAC track when Media Foundation AAC path is active) |
+| `audio.wav`           | Float32 PCM capture mix                                        |
+| `metrics.csv`         | Process metrics (CPU/RAM/FPS) when `RS_CAPTURE_METRICS != 0`   |
+| `clip_with_audio.mp4` | Optional FFmpeg mux output when enabled                        |
 
 ## Use as a library (`capture-runtime`)
 
@@ -113,37 +123,37 @@ See full integration details in [`docs/INTEGRATION.md`](docs/INTEGRATION.md).
 
 All runtime knobs live under `RS_CAPTURE_*` (implemented in [`crates/capture-runtime/src/env.rs`](crates/capture-runtime/src/env.rs)).
 
-| Variable | Purpose |
-|----------|---------|
-| `RS_CAPTURE_FPS` | Nominal target fps (1-240) |
-| `RS_CAPTURE_VIDEO_BITRATE` | Video bitrate in bps |
-| `RS_CAPTURE_AUDIO_CODEC` | `aac` (default) or `opus` |
-| `RS_CAPTURE_AAC_BITRATE` | AAC bitrate (default `192000`) |
-| `RS_CAPTURE_OPUS_BITRATE` | Opus bitrate |
-| `RS_CAPTURE_ENCODER` / `RS_CAPTURE_NVENC` / `RS_CAPTURE_NVENC_REQUIRED` | Video encoder policy |
-| `RS_CAPTURE_ASYNC_ENCODE` | Enable async NVENC queue path |
-| `RS_CAPTURE_FRAME_PACING` | Frame pacing sleep behavior |
-| `RS_CAPTURE_CFR` | CFR-like MP4 sample timing behavior |
-| `RS_CAPTURE_STREAM_BACKPRESSURE` | `block` or `drop` for stream queues |
-| `RS_CAPTURE_PRESENCE_EMPHASIS` | Mid/vocal emphasis in downmix path |
-| `RS_CAPTURE_AV_DRIFT_SAMPLES` | A/V drift trim/pad threshold |
-| `RS_CAPTURE_METRICS` | Write `metrics.csv` (`0` disables) |
-| `RS_CAPTURE_FFMPEG_MUX` | Enable FFmpeg post-mux |
-| `RS_CAPTURE_NO_PRIORITY_BOOST` | Disable priority boost in CLI |
+| Variable                                                                | Purpose                             |
+| ----------------------------------------------------------------------- | ----------------------------------- |
+| `RS_CAPTURE_FPS`                                                        | Nominal target fps (1-240)          |
+| `RS_CAPTURE_VIDEO_BITRATE`                                              | Video bitrate in bps                |
+| `RS_CAPTURE_AUDIO_CODEC`                                                | `aac` (default) or `opus`           |
+| `RS_CAPTURE_AAC_BITRATE`                                                | AAC bitrate (default `192000`)      |
+| `RS_CAPTURE_OPUS_BITRATE`                                               | Opus bitrate                        |
+| `RS_CAPTURE_ENCODER` / `RS_CAPTURE_NVENC` / `RS_CAPTURE_NVENC_REQUIRED` | Video encoder policy                |
+| `RS_CAPTURE_ASYNC_ENCODE`                                               | Enable async NVENC queue path       |
+| `RS_CAPTURE_FRAME_PACING`                                               | Frame pacing sleep behavior         |
+| `RS_CAPTURE_CFR`                                                        | CFR-like MP4 sample timing behavior |
+| `RS_CAPTURE_STREAM_BACKPRESSURE`                                        | `block` or `drop` for stream queues |
+| `RS_CAPTURE_PRESENCE_EMPHASIS`                                          | Mid/vocal emphasis in downmix path  |
+| `RS_CAPTURE_AV_DRIFT_SAMPLES`                                           | A/V drift trim/pad threshold        |
+| `RS_CAPTURE_METRICS`                                                    | Write `metrics.csv` (`0` disables)  |
+| `RS_CAPTURE_FFMPEG_MUX`                                                 | Enable FFmpeg post-mux              |
+| `RS_CAPTURE_NO_PRIORITY_BOOST`                                          | Disable priority boost in CLI       |
 
 ## Repository layout
 
-| Path | Role |
-|------|------|
-| [`crates/capture`](crates/capture) | WGC session and frame acquisition |
-| [`crates/pipeline`](crates/pipeline) | Frame conversion and staging |
-| [`crates/encoder`](crates/encoder) | Video encoder registry and backends |
-| [`crates/audio`](crates/audio) | Loopback capture, downmix, WAV |
-| [`crates/audio_encoder`](crates/audio_encoder) | AAC/Opus encode paths |
-| [`crates/output`](crates/output) | MP4 writing and sample packaging |
-| [`crates/capture-runtime`](crates/capture-runtime) | Public embeddable API |
-| [`crates/app`](crates/app) | Reference binary (`capture-pipeline-app`) |
-| [`vendor/nvenc`](vendor/nvenc) | Patched NVENC crate |
+| Path                                               | Role                                      |
+| -------------------------------------------------- | ----------------------------------------- |
+| [`crates/capture`](crates/capture)                 | WGC session and frame acquisition         |
+| [`crates/pipeline`](crates/pipeline)               | Frame conversion and staging              |
+| [`crates/encoder`](crates/encoder)                 | Video encoder registry and backends       |
+| [`crates/audio`](crates/audio)                     | Loopback capture, downmix, WAV            |
+| [`crates/audio_encoder`](crates/audio_encoder)     | AAC/Opus encode paths                     |
+| [`crates/output`](crates/output)                   | MP4 writing and sample packaging          |
+| [`crates/capture-runtime`](crates/capture-runtime) | Public embeddable API                     |
+| [`crates/app`](crates/app)                         | Reference binary (`capture-pipeline-app`) |
+| [`vendor/nvenc`](vendor/nvenc)                     | Patched NVENC crate                       |
 
 ## Documentation
 
